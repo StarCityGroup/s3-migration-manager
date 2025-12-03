@@ -49,8 +49,40 @@ async fn event_loop(
     s3: &S3Service,
     policy_store: &mut PolicyStore,
 ) -> Result<()> {
+    let mut last_refresh = std::time::Instant::now();
+    let refresh_interval = Duration::from_secs(30);
+
     loop {
         terminal.draw(|frame| draw(frame, app))?;
+
+        // Check if we should auto-load objects for selected bucket
+        if app.pending_bucket_load
+            && let Some(last_change) = app.last_bucket_change
+            && last_change.elapsed() >= Duration::from_secs(1)
+        {
+            app.pending_bucket_load = false;
+            if let Err(err) = load_objects_for_selection(app, s3).await {
+                app.push_status(&format!("Failed to load objects: {err:#}"));
+            }
+        }
+
+        // Check if we should lazy-load more objects
+        if app.should_load_more()
+            && !app.is_loading_objects
+            && let Err(err) = load_more_objects(app, s3).await
+        {
+            app.push_status(&format!("Failed to load more: {err:#}"));
+        }
+
+        // Check if it's time to auto-refresh
+        if last_refresh.elapsed() >= refresh_interval {
+            if !app.objects.is_empty() && app.selected_bucket_name().is_some() {
+                // Silently refresh with pagination
+                let _ = load_objects_for_selection(app, s3).await;
+            }
+            last_refresh = std::time::Instant::now();
+        }
+
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
                 Event::Key(key) => {
@@ -127,7 +159,7 @@ async fn handle_key_event(
         KeyCode::End => jump_selection(app, false),
         KeyCode::Char('m') => {
             app.set_mode(AppMode::EditingMask);
-            app.focus_mask_field(MaskEditorField::Pattern);
+            app.focus_mask_field(MaskEditorField::Name);
             app.push_status(
                 "Mask editor active – Tab moves between fields, arrows/space adjust options, Enter applies",
             );
@@ -146,6 +178,13 @@ async fn handle_key_event(
         KeyCode::Enter => {
             if app.active_pane == ActivePane::Buckets {
                 load_objects_for_selection(app, s3).await?;
+            } else if app.active_pane == ActivePane::Policies {
+                apply_selected_policy(app)?;
+            }
+        }
+        KeyCode::Char('e') => {
+            if app.active_pane == ActivePane::Policies {
+                load_policy_mask_for_editing(app)?;
             }
         }
         KeyCode::Char('s') => {
@@ -174,6 +213,12 @@ async fn handle_key_event(
             } else {
                 app.set_mode(AppMode::ViewingLog);
             }
+        }
+        KeyCode::Char('[') => {
+            cycle_region(app, -1);
+        }
+        KeyCode::Char(']') => {
+            cycle_region(app, 1);
         }
         KeyCode::Esc => {
             if app.active_mask.is_some() {
@@ -273,28 +318,36 @@ fn handle_mask_editor_keys(key: KeyEvent, app: &mut App) {
             }
             _ => {}
         },
-        KeyCode::Left => {
-            if matches!(app.mask_field, MaskEditorField::Mode) {
-                app.cycle_mask_kind_backwards();
-            }
-        }
-        KeyCode::Right => {
-            if matches!(app.mask_field, MaskEditorField::Mode) {
-                app.cycle_mask_kind();
-            }
-        }
+        KeyCode::Left => match app.mask_field {
+            MaskEditorField::Mode => app.cycle_mask_kind_backwards(),
+            MaskEditorField::Case => app.toggle_mask_case(),
+            _ => {}
+        },
+        KeyCode::Right => match app.mask_field {
+            MaskEditorField::Mode => app.cycle_mask_kind(),
+            MaskEditorField::Case => app.toggle_mask_case(),
+            _ => {}
+        },
         KeyCode::Char(' ') => match app.mask_field {
             MaskEditorField::Mode => app.cycle_mask_kind(),
             MaskEditorField::Case => app.toggle_mask_case(),
-            MaskEditorField::Name => app.mask_draft.name.push(' '),
+            MaskEditorField::Name => {
+                // Clear placeholder if still default
+                if app.mask_draft.name == "Untitled mask" {
+                    app.mask_draft.name.clear();
+                }
+                app.mask_draft.name.push(' ');
+            }
             MaskEditorField::Pattern => app.mask_draft.pattern.push(' '),
         },
-        KeyCode::Char('c') => {
-            app.toggle_mask_case();
-            app.focus_mask_field(MaskEditorField::Case);
-        }
         KeyCode::Char(ch) => match app.mask_field {
-            MaskEditorField::Name => app.mask_draft.name.push(ch),
+            MaskEditorField::Name => {
+                // Clear placeholder if still default
+                if app.mask_draft.name == "Untitled mask" {
+                    app.mask_draft.name.clear();
+                }
+                app.mask_draft.name.push(ch);
+            }
             MaskEditorField::Pattern => app.mask_draft.pattern.push(ch),
             MaskEditorField::Mode => {}
             MaskEditorField::Case => {}
@@ -394,12 +447,10 @@ async fn execute_transition(
         return Ok(());
     }
     for key in keys {
-        if restore_first {
-            if let Err(err) = s3.request_restore(&bucket, &key, 7).await {
-                let detail = describe_restore_error(&err);
-                app.push_status(&format!("Restore failed for {key}: {detail}"));
-                continue;
-            }
+        if restore_first && let Err(err) = s3.request_restore(&bucket, &key, 7).await {
+            let detail = describe_restore_error(&err);
+            app.push_status(&format!("Restore failed for {key}: {detail}"));
+            continue;
         }
         match s3
             .transition_storage_class(&bucket, &key, target_class.clone())
@@ -473,8 +524,8 @@ async fn refresh_selected_object(app: &mut App, s3: &S3Service) -> Result<()> {
         app.filtered_objects = app
             .objects
             .iter()
+            .filter(|&obj| mask.matches(&obj.key))
             .cloned()
-            .filter(|obj| mask.matches(&obj.key))
             .collect();
     }
     app.push_status("Object metadata refreshed");
@@ -483,11 +534,79 @@ async fn refresh_selected_object(app: &mut App, s3: &S3Service) -> Result<()> {
 
 async fn load_objects_for_selection(app: &mut App, s3: &S3Service) -> Result<()> {
     if let Some(bucket) = app.selected_bucket_name().map(|b| b.to_string()) {
-        let mut objects = s3.list_objects(&bucket, None).await?;
-        objects.sort_by(|a, b| a.key.cmp(&b.key));
-        app.set_objects(objects);
-        app.apply_mask(app.active_mask.clone());
-        app.push_status(&format!("Loaded objects for bucket {}", bucket));
+        app.reset_pagination();
+        app.is_loading_objects = true;
+        app.push_status(&format!("Counting objects in {}...", bucket));
+
+        // First, get total count (fast)
+        match s3.count_objects(&bucket, None).await {
+            Ok(count) => {
+                app.total_object_count = Some(count);
+                app.push_status(&format!("Found {} objects total", count));
+            }
+            Err(err) => {
+                app.push_status(&format!("Count failed: {err:#}"));
+            }
+        }
+
+        // Then load first page
+        const PAGE_SIZE: i32 = 200;
+        match s3
+            .list_objects_paginated(&bucket, None, None, PAGE_SIZE)
+            .await
+        {
+            Ok((mut objects, next_token)) => {
+                objects.sort_by(|a, b| a.key.cmp(&b.key));
+                app.set_objects(objects);
+                app.continuation_token = next_token;
+                app.apply_mask(app.active_mask.clone());
+
+                let loaded = app.objects.len();
+                let total = app.total_object_count.unwrap_or(loaded);
+                app.push_status(&format!("Loaded {} of {} objects", loaded, total));
+            }
+            Err(err) => {
+                app.push_status(&format!("Failed to load objects: {err:#}"));
+            }
+        }
+
+        app.is_loading_objects = false;
+    }
+    Ok(())
+}
+
+async fn load_more_objects(app: &mut App, s3: &S3Service) -> Result<()> {
+    if app.is_loading_objects || !app.has_more_objects() {
+        return Ok(());
+    }
+
+    if let Some(bucket) = app.selected_bucket_name().map(|b| b.to_string()) {
+        app.is_loading_objects = true;
+
+        const PAGE_SIZE: i32 = 200;
+        match s3
+            .list_objects_paginated(&bucket, None, app.continuation_token.clone(), PAGE_SIZE)
+            .await
+        {
+            Ok((mut new_objects, next_token)) => {
+                new_objects.sort_by(|a, b| a.key.cmp(&b.key));
+                app.append_objects(new_objects);
+                app.continuation_token = next_token;
+
+                let loaded = app.objects.len();
+                let total = app.total_object_count.unwrap_or(loaded);
+                if app.has_more_objects() {
+                    app.push_status(&format!("Loaded {} of {} objects...", loaded, total));
+                } else {
+                    app.push_status(&format!("Loaded all {} objects", total));
+                }
+            }
+            Err(err) => {
+                app.push_status(&format!("Failed to load more: {err:#}"));
+            }
+        }
+
+        app.is_loading_objects = false;
     }
     Ok(())
 }
@@ -506,7 +625,12 @@ fn move_selection(app: &mut App, delta: isize) {
             if idx >= len {
                 idx = len - 1;
             }
-            app.selected_bucket = idx as usize;
+            let new_idx = idx as usize;
+            if new_idx != app.selected_bucket {
+                app.selected_bucket = new_idx;
+                app.last_bucket_change = Some(std::time::Instant::now());
+                app.pending_bucket_load = true;
+            }
         }
         ActivePane::Objects => {
             let len = app.active_objects().len();
@@ -523,7 +647,21 @@ fn move_selection(app: &mut App, delta: isize) {
             }
             app.selected_object = idx as usize;
         }
-        ActivePane::MaskEditor | ActivePane::Policies => {}
+        ActivePane::Policies => {
+            if app.policies.is_empty() {
+                return;
+            }
+            let len = app.policies.len() as isize;
+            let mut idx = app.selected_policy as isize + delta;
+            if idx < 0 {
+                idx = 0;
+            }
+            if idx >= len {
+                idx = len - 1;
+            }
+            app.selected_policy = idx as usize;
+        }
+        ActivePane::MaskEditor => {}
     }
 }
 
@@ -531,7 +669,12 @@ fn jump_selection(app: &mut App, start: bool) {
     match app.active_pane {
         ActivePane::Buckets => {
             if !app.buckets.is_empty() {
-                app.selected_bucket = if start { 0 } else { app.buckets.len() - 1 };
+                let new_idx = if start { 0 } else { app.buckets.len() - 1 };
+                if new_idx != app.selected_bucket {
+                    app.selected_bucket = new_idx;
+                    app.last_bucket_change = Some(std::time::Instant::now());
+                    app.pending_bucket_load = true;
+                }
             }
         }
         ActivePane::Objects => {
@@ -543,8 +686,36 @@ fn jump_selection(app: &mut App, start: bool) {
                 };
             }
         }
+        ActivePane::Policies => {
+            if !app.policies.is_empty() {
+                app.selected_policy = if start { 0 } else { app.policies.len() - 1 };
+            }
+        }
         _ => {}
     }
+}
+
+fn cycle_region(app: &mut App, delta: isize) {
+    let current_region = app.get_current_region_display();
+    let current_idx = app
+        .available_regions
+        .iter()
+        .position(|r| r == &current_region)
+        .unwrap_or(0);
+
+    let new_idx =
+        (current_idx as isize + delta).rem_euclid(app.available_regions.len() as isize) as usize;
+
+    let new_region = app.available_regions[new_idx].clone();
+    let region_to_set = if new_region == "All Regions" {
+        None
+    } else {
+        Some(new_region.clone())
+    };
+
+    app.set_region(region_to_set);
+    app.active_pane = ActivePane::Buckets; // Ensure focus returns to buckets
+    app.push_status(&format!("Region filter: {}", new_region));
 }
 
 fn target_count(app: &App) -> usize {
@@ -568,26 +739,108 @@ fn target_keys(app: &App) -> Vec<String> {
     }
 }
 
+fn apply_selected_policy(app: &mut App) -> Result<()> {
+    if app.policies.is_empty() {
+        anyhow::bail!("No policies available");
+    }
+    let policy = app
+        .policies
+        .get(app.selected_policy)
+        .context("Selected policy index out of bounds")?
+        .clone();
+
+    // Check if the current bucket matches the policy bucket
+    if let Some(current_bucket) = app.selected_bucket_name() {
+        if current_bucket != policy.bucket {
+            app.push_status(&format!(
+                "Policy is for bucket '{}', but you have '{}' selected. Please select the correct bucket first.",
+                policy.bucket, current_bucket
+            ));
+            return Ok(());
+        }
+    } else {
+        app.push_status("Select a bucket first to apply this policy");
+        return Ok(());
+    }
+
+    // Apply the mask
+    app.apply_mask(Some(policy.mask.clone()));
+
+    // Set up the pending action for storage class transition
+    app.pending_action = Some(PendingAction::Transition {
+        target_class: policy.target_storage_class.clone(),
+        restore_first: policy.restore_before_transition,
+    });
+    app.set_mode(AppMode::Confirming);
+    app.push_status(&format!(
+        "Policy '{}' applied. Confirm to transition {} objects to {}",
+        policy.mask.name,
+        app.filtered_objects.len(),
+        policy.target_storage_class.label()
+    ));
+    Ok(())
+}
+
+fn load_policy_mask_for_editing(app: &mut App) -> Result<()> {
+    if app.policies.is_empty() {
+        anyhow::bail!("No policies available");
+    }
+    let policy = app
+        .policies
+        .get(app.selected_policy)
+        .context("Selected policy index out of bounds")?
+        .clone();
+
+    // Load the mask into the draft for editing
+    app.mask_draft.name = policy.mask.name.clone();
+    app.mask_draft.pattern = policy.mask.pattern.clone();
+    app.mask_draft.kind = policy.mask.kind.clone();
+    app.mask_draft.case_sensitive = policy.mask.case_sensitive;
+
+    // Enter mask editing mode
+    app.set_mode(AppMode::EditingMask);
+    app.focus_mask_field(MaskEditorField::Name);
+    app.push_status(&format!("Loaded mask '{}' for editing", policy.mask.name));
+    Ok(())
+}
+
 fn draw(frame: &mut ratatui::Frame, app: &App) {
     let size = frame.size();
+
+    // Main vertical split: content area, status, command bar
     let vertical = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(10), Constraint::Length(6)])
+        .constraints([
+            Constraint::Min(10),
+            Constraint::Length(4),
+            Constraint::Length(3),
+        ])
         .split(size);
 
-    let main = Layout::default()
+    // Horizontal split: main content (left) and policies (right)
+    let horizontal = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(25),
-            Constraint::Percentage(45),
-            Constraint::Percentage(30),
-        ])
+        .constraints([Constraint::Percentage(75), Constraint::Percentage(25)])
         .split(vertical[0]);
 
-    draw_buckets(frame, main[0], app);
-    draw_objects(frame, main[1], app);
-    draw_side_panel(frame, main[2], app);
+    // Left side: bucket selector, mask, objects, object detail
+    let left_panel = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Bucket selector (compact)
+            Constraint::Length(5), // Mask panel
+            Constraint::Min(10),   // Objects list
+            Constraint::Length(8), // Selected object detail
+        ])
+        .split(horizontal[0]);
+
+    draw_bucket_selector(frame, left_panel[0], app);
+    draw_mask_panel(frame, left_panel[1], app);
+    draw_objects(frame, left_panel[2], app);
+    draw_object_detail(frame, left_panel[3], app);
+    draw_policy_panel(frame, horizontal[1], app);
     draw_status(frame, vertical[1], app);
+    draw_command_bar(frame, vertical[2]);
 
     match app.mode {
         AppMode::EditingMask => draw_mask_popup(frame, app),
@@ -599,85 +852,152 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     }
 }
 
-fn draw_buckets(frame: &mut ratatui::Frame, area: Rect, app: &App) {
-    let title = format!("Buckets ({}) – Enter to load objects", app.buckets.len());
+fn draw_bucket_selector(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    let key_style = Style::default()
+        .bg(Color::LightCyan)
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD);
+
+    let bucket_name = app.selected_bucket_name().unwrap_or("(no bucket selected)");
+    let bucket_info = format!("  ({}/{})  ", app.selected_bucket + 1, app.buckets.len());
+
+    let title_style = Style::default()
+        .fg(Color::LightMagenta)
+        .add_modifier(Modifier::BOLD);
+
     let block = Block::default()
-        .title(title)
         .borders(Borders::ALL)
-        .border_style(highlight_border(app.active_pane == ActivePane::Buckets));
-    let items: Vec<ListItem> = app
-        .buckets
-        .iter()
-        .enumerate()
-        .map(|(idx, bucket)| {
-            let subtitle = bucket
-                .region
-                .clone()
-                .unwrap_or_else(|| "region unresolved".into());
-            let is_selected = idx == app.selected_bucket;
-            let marker = if is_selected { ">" } else { " " };
-            let marker_style = if is_selected {
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled(marker.to_string(), marker_style),
-                Span::raw(" "),
-                Span::styled(&bucket.name, Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(" "),
-                Span::styled(subtitle, Style::default().fg(Color::Gray)),
-            ]))
-        })
-        .collect();
-    let mut state = ListState::default();
-    state.select(Some(
-        app.selected_bucket.min(app.buckets.len().saturating_sub(1)),
-    ));
-    let list = List::new(items)
-        .highlight_style(Style::default().fg(Color::Cyan))
-        .block(block);
-    frame.render_stateful_widget(list, area, &mut state);
+        .border_style(highlight_border(app.active_pane == ActivePane::Buckets))
+        .style(Style::default().bg(Color::Black).fg(Color::White));
+
+    let text = Line::from(vec![
+        Span::styled("Region: ", Style::default().fg(Color::Cyan)),
+        Span::styled(
+            app.get_current_region_display(),
+            Style::default()
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled("[", key_style),
+        Span::styled("]", key_style),
+        Span::raw("◀▶  │  "),
+        Span::styled("Bucket: ", Style::default().fg(Color::Cyan)),
+        Span::styled(bucket_name, title_style),
+        Span::raw(bucket_info),
+        Span::styled("↑", key_style),
+        Span::styled("↓", key_style),
+        Span::raw(" navigate"),
+    ]);
+
+    let para = Paragraph::new(text).block(block);
+    frame.render_widget(para, area);
 }
 
 fn draw_objects(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     let objects = app.active_objects();
-    let title = if let Some(mask) = &app.active_mask {
-        format!("Objects – mask: {}", mask.summary())
+    let loaded_count = app.objects.len();
+    let total_count = app.total_object_count.unwrap_or(loaded_count);
+
+    let loading_indicator = if app.is_loading_objects {
+        " ⟳"
+    } else if app.has_more_objects() {
+        " +"
     } else {
-        "Objects".to_string()
+        ""
     };
+
+    let title = if let Some(mask) = &app.active_mask {
+        format!(
+            "Objects – mask: {} ({} matches of {} loaded{}){}",
+            mask.summary(),
+            app.filtered_objects.len(),
+            loaded_count,
+            if loaded_count < total_count {
+                format!(" of {}", total_count)
+            } else {
+                String::new()
+            },
+            loading_indicator
+        )
+    } else {
+        format!(
+            "Objects (showing {} of {}){}",
+            loaded_count, total_count, loading_indicator
+        )
+    };
+    let title_style = Style::default()
+        .fg(Color::LightCyan)
+        .add_modifier(Modifier::BOLD);
     let block = Block::default()
-        .title(title)
+        .title(Span::styled(title, title_style))
         .borders(Borders::ALL)
-        .border_style(highlight_border(app.active_pane == ActivePane::Objects));
+        .border_style(highlight_border(app.active_pane == ActivePane::Objects))
+        .style(Style::default().bg(Color::Black));
+
+    // Calculate available width for the key column
+    // 2 (marker) + 1 (space) + 13 (size) + 1 (space) + 20 (storage) + 1 (space) + 4 (restore) + 2 (borders) = 44
+    let fixed_width = 44;
+    let key_width = area.width.saturating_sub(fixed_width).max(20) as usize;
+
     let items: Vec<ListItem> = objects
         .iter()
         .enumerate()
         .map(|(idx, obj)| {
             let is_selected = idx == app.selected_object;
-            let marker = if is_selected { ">" } else { " " };
+            let marker = if is_selected { "►" } else { " " };
             let marker_style = if is_selected {
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(Color::LightYellow)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            ListItem::new(Line::from(vec![
+            let key_style = if is_selected {
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+
+            // Truncate or pad the key to fixed width
+            let key_display = if obj.key.len() > key_width {
+                format!("{}…", &obj.key[..key_width.saturating_sub(1)])
+            } else {
+                format!("{:<width$}", obj.key, width = key_width)
+            };
+
+            // Format storage class with fixed width
+            let storage_label = format!("{:<20}", obj.storage_class.label());
+
+            // Get restore status symbol
+            let restore_symbol = match &obj.restore_state {
+                Some(RestoreState::Available) => " [✓]",
+                Some(RestoreState::InProgress { .. }) => " [⟳]",
+                Some(RestoreState::Expired) => " [✗]",
+                None => "    ",
+            };
+
+            let restore_style = match &obj.restore_state {
+                Some(RestoreState::Available) => Style::default().fg(Color::LightGreen),
+                Some(RestoreState::InProgress { .. }) => Style::default().fg(Color::Yellow),
+                Some(RestoreState::Expired) => Style::default().fg(Color::Red),
+                None => Style::default().fg(Color::DarkGray),
+            };
+
+            let spans = vec![
                 Span::styled(marker.to_string(), marker_style),
                 Span::raw(" "),
-                Span::raw(obj.key.clone()),
+                Span::styled(key_display, key_style),
                 Span::raw(" "),
-                Span::styled(format_size(obj.size), Style::default().fg(Color::Gray)),
+                Span::styled(format_size(obj.size), Style::default().fg(Color::LightCyan)),
                 Span::raw(" "),
-                Span::styled(
-                    obj.storage_class.label(),
-                    Style::default().fg(Color::Yellow),
-                ),
-            ]))
+                Span::styled(storage_label, storage_class_color(&obj.storage_class)),
+                Span::styled(restore_symbol, restore_style),
+            ];
+
+            ListItem::new(Line::from(spans))
         })
         .collect();
     let mut state = ListState::default();
@@ -685,30 +1005,19 @@ fn draw_objects(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         state.select(Some(app.selected_object.min(objects.len() - 1)));
     }
     let list = List::new(items)
-        .highlight_style(Style::default().bg(Color::Blue).fg(Color::Black))
+        .highlight_style(Style::default().bg(Color::Blue))
         .block(block);
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn draw_side_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(8),
-            Constraint::Length(7),
-            Constraint::Min(5),
-        ])
-        .split(area);
-
-    draw_object_detail(frame, chunks[0], app);
-    draw_mask_panel(frame, chunks[1], app);
-    draw_policy_panel(frame, chunks[2], app);
-}
-
 fn draw_object_detail(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    let title_style = Style::default()
+        .fg(Color::LightYellow)
+        .add_modifier(Modifier::BOLD);
     let block = Block::default()
-        .title("Selected object")
-        .borders(Borders::ALL);
+        .title(Span::styled("Selected object", title_style))
+        .borders(Borders::ALL)
+        .style(Style::default().bg(Color::Black));
     let lines = if let Some(obj) = app.selected_object() {
         let modified = obj
             .last_modified
@@ -734,43 +1043,91 @@ fn draw_object_detail(frame: &mut ratatui::Frame, area: Rect, app: &App) {
 }
 
 fn draw_mask_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    let title_style = Style::default()
+        .fg(Color::LightMagenta)
+        .add_modifier(Modifier::BOLD);
     let block = Block::default()
-        .title("Mask")
+        .title(Span::styled("Filter Mask", title_style))
         .borders(Borders::ALL)
-        .border_style(highlight_border(app.active_pane == ActivePane::MaskEditor));
-    let mut lines = Vec::new();
-    if let Some(mask) = &app.active_mask {
-        lines.push(Line::from(format!("Active: {}", mask.summary())));
-        lines.push(Line::from(format!(
-            "{} objects currently targeted",
-            app.filtered_objects.len()
-        )));
+        .border_style(highlight_border(app.active_pane == ActivePane::MaskEditor))
+        .style(Style::default().bg(Color::Black));
+
+    let content = if let Some(mask) = &app.active_mask {
+        let count_style = Style::default()
+            .fg(Color::LightYellow)
+            .add_modifier(Modifier::BOLD);
+        Line::from(vec![
+            Span::styled("Active: ", Style::default().fg(Color::Cyan)),
+            Span::styled(mask.summary(), Style::default().fg(Color::LightGreen)),
+            Span::raw("  "),
+            Span::styled(
+                format!("({} matches)", app.filtered_objects.len()),
+                count_style,
+            ),
+            Span::raw("  "),
+            Span::styled("Esc", Style::default().bg(Color::DarkGray).fg(Color::White)),
+            Span::raw(" clear  "),
+            Span::styled("m", Style::default().bg(Color::DarkGray).fg(Color::White)),
+            Span::raw(" edit"),
+        ])
     } else {
-        lines.push(Line::from("No active mask. Press 'm' to edit."));
-    }
-    lines.push(Line::from(
-        "Mask tips: Tab cycles fields · arrows/space adjust options · Enter applies · Esc cancels",
-    ));
-    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
+        Line::from(vec![
+            Span::styled("None. Press ", Style::default().fg(Color::Gray)),
+            Span::styled("m", Style::default().bg(Color::LightCyan).fg(Color::Black)),
+            Span::styled(" to create a filter mask", Style::default().fg(Color::Gray)),
+        ])
+    };
+
+    let para = Paragraph::new(content).block(block);
     frame.render_widget(para, area);
 }
 
 fn draw_policy_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    let title_style = Style::default()
+        .fg(Color::LightGreen)
+        .add_modifier(Modifier::BOLD);
     let block = Block::default()
-        .title("Policies")
+        .title(Span::styled(
+            "Policies – Enter apply, e edit mask",
+            title_style,
+        ))
         .borders(Borders::ALL)
-        .border_style(highlight_border(app.active_pane == ActivePane::Policies));
+        .border_style(highlight_border(app.active_pane == ActivePane::Policies))
+        .style(Style::default().bg(Color::Black));
     let lines: Vec<Line> = app
         .policies
         .iter()
-        .take(4)
-        .map(|policy| {
-            Line::from(format!(
-                "{} -> {} ({})",
-                policy.mask.name,
-                policy.target_storage_class.label(),
-                policy.bucket
-            ))
+        .enumerate()
+        .map(|(idx, policy)| {
+            let is_selected = idx == app.selected_policy;
+            let marker = if is_selected { "►" } else { " " };
+            let marker_style = if is_selected {
+                Style::default()
+                    .fg(Color::LightYellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let text_style = if is_selected {
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            Line::from(vec![
+                Span::styled(marker, marker_style),
+                Span::raw(" "),
+                Span::styled(
+                    format!(
+                        "{} -> {} ({})",
+                        policy.mask.name,
+                        policy.target_storage_class.label(),
+                        policy.bucket
+                    ),
+                    text_style,
+                ),
+            ])
         })
         .collect();
     let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
@@ -778,23 +1135,58 @@ fn draw_policy_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
 }
 
 fn draw_status(frame: &mut ratatui::Frame, area: Rect, app: &App) {
-    let help = Line::from(vec![
-        Span::raw("Tab switch "),
-        Span::raw("m mask "),
-        Span::raw("s storage "),
-        Span::raw("p save-policy "),
-        Span::raw("r restore "),
-        Span::raw("i inspect "),
-        Span::raw("f refresh "),
-        Span::raw("Esc clear "),
-        Span::raw("? help "),
-        Span::raw("l log "),
-        Span::raw("q quit"),
-    ]);
-    let mut lines = vec![help];
-    lines.extend(app.status.iter().rev().map(|msg| Line::from(msg.clone())));
-    let block = Block::default().borders(Borders::ALL).title("Status");
+    let lines: Vec<Line> = app
+        .status
+        .iter()
+        .rev()
+        .map(|msg| Line::from(msg.clone()))
+        .collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            "Status",
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(Color::Black));
     let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
+    frame.render_widget(para, area);
+}
+
+fn draw_command_bar(frame: &mut ratatui::Frame, area: Rect) {
+    let key_style = Style::default()
+        .bg(Color::LightCyan)
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD);
+    let help = Line::from(vec![
+        Span::styled(" Tab ", key_style),
+        Span::raw(" "),
+        Span::styled(" m ", key_style),
+        Span::raw("ask "),
+        Span::styled(" s ", key_style),
+        Span::raw("torage "),
+        Span::styled(" p ", key_style),
+        Span::raw("olicy "),
+        Span::styled(" r ", key_style),
+        Span::raw("estore "),
+        Span::styled(" i ", key_style),
+        Span::raw("nfo "),
+        Span::styled(" [ ] ", key_style),
+        Span::raw("egion "),
+        Span::styled(" f ", key_style),
+        Span::raw("refresh "),
+        Span::styled(" ? ", key_style),
+        Span::raw("help "),
+        Span::styled(" l ", key_style),
+        Span::raw("og "),
+        Span::styled(" q ", key_style),
+        Span::raw("uit"),
+    ]);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .style(Style::default().bg(Color::Blue).fg(Color::White));
+    let para = Paragraph::new(help).block(block);
     frame.render_widget(para, area);
 }
 
@@ -834,7 +1226,7 @@ fn draw_mask_popup(frame: &mut ratatui::Frame, app: &App) {
             } else {
                 "off"
             }),
-            Span::raw("  (space or 'c' toggles)"),
+            Span::raw("  (space or ←/→ toggles)"),
         ]),
         Line::from("Enter applies the mask. Esc cancels and restores previous filter."),
     ];
@@ -862,82 +1254,223 @@ fn draw_storage_popup(frame: &mut ratatui::Frame, app: &App) {
 }
 
 fn draw_confirm_popup(frame: &mut ratatui::Frame, app: &App) {
-    let area = centered_rect(50, 30, frame.size());
+    let area = centered_rect(60, 40, frame.size());
     draw_modal_surface(frame, area);
-    let mut lines = vec![Line::from(
-        "Confirm operation (Enter/y to proceed, Esc/n to cancel, o toggle restore-first)",
-    )];
+
+    let key_style = Style::default()
+        .bg(Color::LightYellow)
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD);
+    let warn_style = Style::default()
+        .fg(Color::LightYellow)
+        .add_modifier(Modifier::BOLD);
+    let highlight_style = Style::default()
+        .fg(Color::LightGreen)
+        .add_modifier(Modifier::BOLD);
+
+    let mut lines = Vec::new();
+
     if let Some(action) = &app.pending_action {
         match action {
             PendingAction::Transition {
                 target_class,
                 restore_first,
             } => {
-                lines.push(Line::from(format!(
-                    "Transition {} object(s) to {}",
-                    target_count(app),
-                    target_class.label()
-                )));
-                lines.push(Line::from(format!(
-                    "Restore before transition: {}",
-                    if *restore_first { "yes" } else { "no" }
-                )));
+                lines.push(Line::from(vec![Span::styled(
+                    "Transition Storage Class",
+                    warn_style,
+                )]));
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![
+                    Span::raw("  Objects: "),
+                    Span::styled(format!("{}", target_count(app)), highlight_style),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::raw("  Target:  "),
+                    Span::styled(target_class.label(), highlight_style),
+                ]));
+                lines.push(Line::from(""));
+                let restore_value = if *restore_first { "YES" } else { "NO" };
+                let restore_color = if *restore_first {
+                    Color::LightGreen
+                } else {
+                    Color::Gray
+                };
+                lines.push(Line::from(vec![
+                    Span::raw("  Restore first: "),
+                    Span::styled(
+                        restore_value,
+                        Style::default()
+                            .fg(restore_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  (press "),
+                    Span::styled("o", key_style),
+                    Span::raw(" to toggle)"),
+                ]));
             }
             PendingAction::Restore { days } => {
-                lines.push(Line::from(format!(
-                    "Request restore for {} object(s) ({} days)",
-                    target_count(app),
-                    days
-                )));
+                lines.push(Line::from(vec![Span::styled(
+                    "Request Glacier Restore",
+                    warn_style,
+                )]));
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![
+                    Span::raw("  Objects:  "),
+                    Span::styled(format!("{}", target_count(app)), highlight_style),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::raw("  Duration: "),
+                    Span::styled(format!("{} days", days), highlight_style),
+                ]));
             }
             PendingAction::SavePolicy { target_class } => {
-                lines.push(Line::from("Save policy with current mask"));
-                lines.push(Line::from(format!(
-                    "Bucket: {}",
-                    app.selected_bucket_name().unwrap_or("n/a")
-                )));
-                lines.push(Line::from(format!(
-                    "Target storage class: {}",
-                    target_class.label()
-                )));
+                lines.push(Line::from(vec![Span::styled(
+                    "Save Migration Policy",
+                    warn_style,
+                )]));
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![
+                    Span::raw("  Bucket: "),
+                    Span::styled(app.selected_bucket_name().unwrap_or("n/a"), highlight_style),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::raw("  Target: "),
+                    Span::styled(target_class.label(), highlight_style),
+                ]));
             }
         }
     }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(" Enter ", key_style),
+        Span::raw(" Confirm   "),
+        Span::styled(" Esc ", key_style),
+        Span::raw(" Cancel"),
+    ]));
+
     let block = Block::default()
-        .title("Confirm")
+        .title(Span::styled(
+            " Confirm Action ",
+            Style::default()
+                .fg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD),
+        ))
         .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
         .style(Style::default().bg(Color::Black));
-    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
+    let para = Paragraph::new(lines).block(block);
     frame.render_widget(para, area);
 }
 
 fn draw_help_popup(frame: &mut ratatui::Frame) {
-    let area = centered_rect(70, 70, frame.size());
+    let area = centered_rect(80, 80, frame.size());
     draw_modal_surface(frame, area);
+    let title_style = Style::default()
+        .fg(Color::LightYellow)
+        .add_modifier(Modifier::BOLD);
     let block = Block::default()
-        .title("Cheat Sheet – Esc/?/Enter to close")
+        .title(Span::styled(
+            "Help & Workflow Guide – Press ? or Esc to close",
+            title_style,
+        ))
         .borders(Borders::ALL)
         .style(Style::default().bg(Color::Black));
+
+    let key_style = Style::default()
+        .fg(Color::LightCyan)
+        .add_modifier(Modifier::BOLD);
+    let header_style = Style::default()
+        .fg(Color::LightGreen)
+        .add_modifier(Modifier::BOLD);
+
     let lines = vec![
+        Line::from(vec![Span::styled("BASIC WORKFLOW", header_style)]),
         Line::from(
-            "Navigation: Tab/Shift+Tab switch panes · Arrows/pg keys move · Enter loads bucket objects",
+            "1. Navigate with Tab/Shift+Tab to switch between panes (Buckets, Objects, Policies)",
         ),
-        Line::from(
-            "Masks: press 'm' to edit · Tab moves between fields · arrows/space adjust match mode/case · Enter applies",
-        ),
-        Line::from(
-            "Apply mask with Enter, Esc cancels; active mask targets operations at all matches.",
-        ),
-        Line::from(
-            "Storage: 's' selects destination class, 'o' toggles restore-first during confirmation, Enter accepts.",
-        ),
-        Line::from("Policies: 'p' uses current mask + bucket, then choose a target class to save."),
-        Line::from(
-            "Restores: 'r' requests 7-day restore for selected/masked objects; 'i' refreshes metadata via HeadObject.",
-        ),
-        Line::from(
-            "Logs: 'l' opens the status log overlay for full error messages; 'f' refreshes buckets; Esc clears masks/dialogs; 'q'/Ctrl+C quits.",
-        ),
+        Line::from("2. Select a bucket with arrows, press Enter to load its objects"),
+        Line::from("3. Create a mask (press 'm') to filter objects by pattern"),
+        Line::from("4. Transition objects to different storage classes or request restores"),
+        Line::from(""),
+        Line::from(vec![Span::styled("NAVIGATION", header_style)]),
+        Line::from(vec![
+            Span::styled("Tab/Shift+Tab", key_style),
+            Span::raw(" - Switch between panes  "),
+            Span::styled("↑↓", key_style),
+            Span::raw(" - Move selection  "),
+            Span::styled("PgUp/PgDn", key_style),
+            Span::raw(" - Jump 5 items"),
+        ]),
+        Line::from(vec![
+            Span::styled("Enter", key_style),
+            Span::raw(" - Load bucket objects (Buckets pane) or apply policy (Policies pane)"),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled("OBJECT FILTERING (MASKS)", header_style)]),
+        Line::from(vec![
+            Span::styled("m", key_style),
+            Span::raw(" - Open mask editor to create/edit filters"),
+        ]),
+        Line::from("   • Tab moves between fields: Name → Pattern → Mode → Case"),
+        Line::from("   • Match modes: Prefix, Suffix, Contains, Regex (use arrows/space to cycle)"),
+        Line::from("   • Enter applies the mask, Esc cancels"),
+        Line::from("   • Active masks filter the object list and target all matching objects"),
+        Line::from(vec![
+            Span::styled("Esc", key_style),
+            Span::raw(" - Clear active mask and show all objects"),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled("STORAGE OPERATIONS", header_style)]),
+        Line::from(vec![
+            Span::styled("s", key_style),
+            Span::raw(" - Transition objects to a different storage class"),
+        ]),
+        Line::from("   • Without mask: transitions the selected object only"),
+        Line::from("   • With mask: transitions ALL matching objects"),
+        Line::from("   • Press 'o' during confirmation to toggle restore-before-transition"),
+        Line::from(vec![
+            Span::styled("r", key_style),
+            Span::raw(" - Request 7-day Glacier restore for selected/masked objects"),
+        ]),
+        Line::from(vec![
+            Span::styled("i", key_style),
+            Span::raw(" - Inspect selected object (refreshes metadata via HeadObject)"),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled("POLICIES (SAVE & REUSE)", header_style)]),
+        Line::from(vec![
+            Span::styled("p", key_style),
+            Span::raw(" - Save current mask as a policy (stores mask + bucket + target class)"),
+        ]),
+        Line::from("In Policies pane (use Tab to focus):"),
+        Line::from(vec![
+            Span::raw("   "),
+            Span::styled("Enter", key_style),
+            Span::raw(" - Apply selected policy (applies mask + transitions to saved class)"),
+        ]),
+        Line::from(vec![
+            Span::raw("   "),
+            Span::styled("e", key_style),
+            Span::raw(" - Load policy mask into editor for modification before applying"),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled("OTHER COMMANDS", header_style)]),
+        Line::from(vec![
+            Span::styled("l", key_style),
+            Span::raw(" - Toggle status log (view full error messages)  "),
+            Span::styled("f", key_style),
+            Span::raw(" - Refresh bucket list"),
+        ]),
+        Line::from(vec![
+            Span::styled("?", key_style),
+            Span::raw(" - Toggle this help screen  "),
+            Span::styled("q", key_style),
+            Span::raw(" or "),
+            Span::styled("Ctrl+C", key_style),
+            Span::raw(" - Quit application"),
+        ]),
     ];
     let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
     frame.render_widget(para, area);
@@ -1078,23 +1611,46 @@ fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
 
 fn highlight_border(active: bool) -> Style {
     if active {
-        Style::default().fg(Color::Cyan)
-    } else {
         Style::default()
+            .fg(Color::LightYellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
     }
 }
 
 fn format_size(size: i64) -> String {
     const KB: f64 = 1024.0;
-    const MB: f64 = KB * 1024.0;
-    const GB: f64 = MB * 1024.0;
-    if size as f64 > GB {
-        format!("{:.2} GB", size as f64 / GB)
-    } else if size as f64 > MB {
-        format!("{:.2} MB", size as f64 / MB)
-    } else if size as f64 > KB {
-        format!("{:.2} KB", size as f64 / KB)
-    } else {
-        format!("{size} B")
+    let kb = size as f64 / KB;
+    format!("{:>10.2} KB", kb)
+}
+
+fn storage_class_color(storage_class: &StorageClassTier) -> Style {
+    match storage_class {
+        StorageClassTier::Standard => Style::default()
+            .fg(Color::LightGreen)
+            .add_modifier(Modifier::BOLD),
+        StorageClassTier::StandardIa => Style::default()
+            .fg(Color::LightYellow)
+            .add_modifier(Modifier::BOLD),
+        StorageClassTier::OneZoneIa => Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+        StorageClassTier::IntelligentTiering => Style::default()
+            .fg(Color::LightMagenta)
+            .add_modifier(Modifier::BOLD),
+        StorageClassTier::GlacierInstantRetrieval => Style::default()
+            .fg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD),
+        StorageClassTier::GlacierFlexibleRetrieval => Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+        StorageClassTier::GlacierDeepArchive => Style::default()
+            .fg(Color::LightBlue)
+            .add_modifier(Modifier::BOLD),
+        StorageClassTier::ReducedRedundancy => Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD),
+        StorageClassTier::Unknown(_) => Style::default().fg(Color::DarkGray),
     }
 }

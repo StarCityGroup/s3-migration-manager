@@ -42,15 +42,88 @@ impl S3Service {
             .send()
             .await?;
         let constraint = resp.location_constraint();
-        Ok(constraint.and_then(|c| {
-            if c.as_str().is_empty() {
-                None
-            } else {
-                Some(c.as_str().to_string())
-            }
-        }))
+        Ok(constraint
+            .map(|c| {
+                let region_str = c.as_str();
+                if region_str.is_empty() {
+                    "us-east-1".to_string()
+                } else {
+                    region_str.to_string()
+                }
+            })
+            .or(Some("us-east-1".to_string())))
     }
 
+    /// Count total objects in bucket without loading full details (fast)
+    pub async fn count_objects(&self, bucket: &str, prefix: Option<&str>) -> Result<usize> {
+        let mut continuation_token: Option<String> = None;
+        let mut total_count = 0;
+        loop {
+            let mut request = self.client.list_objects_v2().bucket(bucket);
+            if let Some(token) = &continuation_token {
+                request = request.continuation_token(token);
+            }
+            if let Some(pref) = prefix {
+                request = request.prefix(pref);
+            }
+            let response = request.send().await?;
+            total_count += response.key_count().unwrap_or(0) as usize;
+
+            if response.is_truncated().unwrap_or(false) {
+                continuation_token = response
+                    .next_continuation_token()
+                    .map(|token| token.to_string());
+            } else {
+                break;
+            }
+        }
+        Ok(total_count)
+    }
+
+    /// Load a page of objects with optional continuation token
+    pub async fn list_objects_paginated(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+        continuation_token: Option<String>,
+        max_keys: i32,
+    ) -> Result<(Vec<ObjectInfo>, Option<String>)> {
+        let mut request = self
+            .client
+            .list_objects_v2()
+            .bucket(bucket)
+            .max_keys(max_keys);
+        if let Some(token) = continuation_token {
+            request = request.continuation_token(token);
+        }
+        if let Some(pref) = prefix {
+            request = request.prefix(pref);
+        }
+        let response = request.send().await?;
+
+        let mut objects = Vec::new();
+        for object in response.contents() {
+            if let Some(key) = object.key() {
+                objects.push(ObjectInfo {
+                    key: key.to_string(),
+                    size: object.size().unwrap_or_default(),
+                    last_modified: object.last_modified().map(|dt| dt.to_string()),
+                    storage_class: StorageClassTier::from(object.storage_class().cloned()),
+                    restore_state: None,
+                });
+            }
+        }
+
+        let next_token = if response.is_truncated().unwrap_or(false) {
+            response.next_continuation_token().map(|t| t.to_string())
+        } else {
+            None
+        };
+
+        Ok((objects, next_token))
+    }
+
+    /// Load all objects (old behavior, kept for compatibility)
     pub async fn list_objects(
         &self,
         bucket: &str,
