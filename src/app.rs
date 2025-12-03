@@ -11,7 +11,7 @@ pub enum ActivePane {
     Buckets,
     Objects,
     MaskEditor,
-    Policies,
+    Templates,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,13 +80,15 @@ impl Default for MaskDraft {
 pub enum PendingAction {
     Transition {
         target_class: StorageClassTier,
-        restore_first: bool,
     },
     Restore {
         days: i32,
     },
     SavePolicy {
         target_class: StorageClassTier,
+    },
+    DeletePolicy {
+        policy_index: usize,
     },
 }
 
@@ -300,18 +302,18 @@ impl App {
     pub fn next_pane(&mut self) {
         self.active_pane = match self.active_pane {
             ActivePane::Buckets => ActivePane::Objects,
-            ActivePane::Objects => ActivePane::Policies,
-            ActivePane::MaskEditor => ActivePane::Policies,
-            ActivePane::Policies => ActivePane::Buckets,
+            ActivePane::Objects => ActivePane::Templates,
+            ActivePane::MaskEditor => ActivePane::Templates,
+            ActivePane::Templates => ActivePane::Buckets,
         };
     }
 
     pub fn previous_pane(&mut self) {
         self.active_pane = match self.active_pane {
-            ActivePane::Buckets => ActivePane::Policies,
+            ActivePane::Buckets => ActivePane::Templates,
             ActivePane::Objects => ActivePane::Buckets,
             ActivePane::MaskEditor => ActivePane::Buckets,
-            ActivePane::Policies => ActivePane::Objects,
+            ActivePane::Templates => ActivePane::Objects,
         };
     }
 
@@ -358,5 +360,68 @@ impl App {
 
     pub fn previous_mask_field(&mut self) {
         self.mask_field = self.mask_field.previous();
+    }
+
+    /// Check if any of the targeted objects need restoration
+    /// (i.e., they are in Glacier storage class and not already restored)
+    pub fn any_targets_need_restoration(&self) -> bool {
+        let objects = if self.active_mask.is_some() {
+            &self.filtered_objects
+        } else if let Some(obj) = self.objects.get(self.selected_object) {
+            std::slice::from_ref(obj)
+        } else {
+            return false;
+        };
+
+        objects.iter().any(|obj| {
+            matches!(
+                obj.storage_class,
+                StorageClassTier::GlacierFlexibleRetrieval | StorageClassTier::GlacierDeepArchive
+            ) && !matches!(
+                obj.restore_state,
+                Some(crate::models::RestoreState::Available)
+                    | Some(crate::models::RestoreState::InProgress { .. })
+            )
+        })
+    }
+
+    /// Get count of objects that need restore (not already restored/restoring)
+    pub fn count_objects_needing_restore(&self) -> usize {
+        let objects = if self.active_mask.is_some() {
+            &self.filtered_objects
+        } else if let Some(obj) = self.objects.get(self.selected_object) {
+            std::slice::from_ref(obj)
+        } else {
+            return 0;
+        };
+
+        objects.iter().filter(|obj| {
+            matches!(
+                obj.storage_class,
+                StorageClassTier::GlacierFlexibleRetrieval | StorageClassTier::GlacierDeepArchive
+            ) && !matches!(
+                obj.restore_state,
+                Some(crate::models::RestoreState::Available)
+                    | Some(crate::models::RestoreState::InProgress { .. })
+            )
+        }).count()
+    }
+
+    /// Get count of objects already being restored
+    pub fn count_objects_restoring(&self) -> usize {
+        let objects = if self.active_mask.is_some() {
+            &self.filtered_objects
+        } else if let Some(obj) = self.objects.get(self.selected_object) {
+            std::slice::from_ref(obj)
+        } else {
+            return 0;
+        };
+
+        objects.iter().filter(|obj| {
+            matches!(
+                obj.restore_state,
+                Some(crate::models::RestoreState::InProgress { .. })
+            )
+        }).count()
     }
 }

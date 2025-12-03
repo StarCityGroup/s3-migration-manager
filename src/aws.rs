@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
-use aws_sdk_s3::types::{MetadataDirective, RestoreRequest};
+use aws_sdk_s3::types::{MetadataDirective, RestoreRequest, RestoreStatus};
 use chrono::{DateTime, Utc};
 
 use crate::models::{BucketInfo, ObjectInfo, RestoreState, StorageClassTier};
@@ -109,7 +109,7 @@ impl S3Service {
                     size: object.size().unwrap_or_default(),
                     last_modified: object.last_modified().map(|dt| dt.to_string()),
                     storage_class: StorageClassTier::from(object.storage_class().cloned()),
-                    restore_state: None,
+                    restore_state: parse_restore_status(object.restore_status()),
                 });
             }
         }
@@ -123,45 +123,6 @@ impl S3Service {
         Ok((objects, next_token))
     }
 
-    /// Load all objects (old behavior, kept for compatibility)
-    pub async fn list_objects(
-        &self,
-        bucket: &str,
-        prefix: Option<&str>,
-    ) -> Result<Vec<ObjectInfo>> {
-        let mut continuation_token: Option<String> = None;
-        let mut objects = Vec::new();
-        loop {
-            let mut request = self.client.list_objects_v2().bucket(bucket);
-            if let Some(token) = &continuation_token {
-                request = request.continuation_token(token);
-            }
-            if let Some(pref) = prefix {
-                request = request.prefix(pref);
-            }
-            let response = request.send().await?;
-            for object in response.contents() {
-                if let Some(key) = object.key() {
-                    objects.push(ObjectInfo {
-                        key: key.to_string(),
-                        size: object.size().unwrap_or_default(),
-                        last_modified: object.last_modified().map(|dt| dt.to_string()),
-                        storage_class: StorageClassTier::from(object.storage_class().cloned()),
-                        restore_state: None,
-                    });
-                }
-            }
-
-            if response.is_truncated().unwrap_or(false) {
-                continuation_token = response
-                    .next_continuation_token()
-                    .map(|token| token.to_string());
-            } else {
-                break;
-            }
-        }
-        Ok(objects)
-    }
 
     pub async fn refresh_object(&self, bucket: &str, key: &str) -> Result<ObjectInfo> {
         let head = self
@@ -236,6 +197,19 @@ fn parse_restore_state(raw: Option<&str>) -> Option<RestoreState> {
             RestoreState::Available
         } else {
             RestoreState::Expired
+        }
+    })
+}
+
+fn parse_restore_status(status: Option<&RestoreStatus>) -> Option<RestoreState> {
+    status.map(|s| {
+        let is_ongoing = s.is_restore_in_progress().unwrap_or(false);
+
+        if is_ongoing {
+            let expiry = s.restore_expiry_date().map(|dt| dt.to_string());
+            RestoreState::InProgress { expiry }
+        } else {
+            RestoreState::Available
         }
     })
 }

@@ -13,28 +13,22 @@ use crate::models::StorageClassTier;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MigrationPolicy {
     pub id: Uuid,
-    pub bucket: String,
     pub mask: ObjectMask,
     pub target_storage_class: StorageClassTier,
-    pub restore_before_transition: bool,
     pub notes: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
 impl MigrationPolicy {
     pub fn new(
-        bucket: String,
         mask: ObjectMask,
         target_storage_class: StorageClassTier,
-        restore_before_transition: bool,
         notes: Option<String>,
     ) -> Self {
         Self {
             id: Uuid::new_v4(),
-            bucket,
             mask,
             target_storage_class,
-            restore_before_transition,
             notes,
             created_at: Utc::now(),
         }
@@ -88,6 +82,15 @@ impl PolicyStore {
     pub fn add(&mut self, policy: MigrationPolicy) -> Result<()> {
         self.policies.push(policy);
         self.save()
+    }
+
+    pub fn remove(&mut self, index: usize) -> Result<()> {
+        if index < self.policies.len() {
+            self.policies.remove(index);
+            self.save()
+        } else {
+            anyhow::bail!("Policy index {} out of bounds", index)
+        }
     }
 }
 

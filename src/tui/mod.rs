@@ -178,13 +178,18 @@ async fn handle_key_event(
         KeyCode::Enter => {
             if app.active_pane == ActivePane::Buckets {
                 load_objects_for_selection(app, s3).await?;
-            } else if app.active_pane == ActivePane::Policies {
+            } else if app.active_pane == ActivePane::Templates {
                 apply_selected_policy(app)?;
             }
         }
         KeyCode::Char('e') => {
-            if app.active_pane == ActivePane::Policies {
+            if app.active_pane == ActivePane::Templates {
                 load_policy_mask_for_editing(app)?;
+            }
+        }
+        KeyCode::Char('d') => {
+            if app.active_pane == ActivePane::Templates {
+                initiate_policy_delete(app);
             }
         }
         KeyCode::Char('s') => {
@@ -199,9 +204,9 @@ async fn handle_key_event(
         }
         KeyCode::Char('p') => {
             if let Err(err) = begin_storage_selection(app, StorageIntent::SavePolicy) {
-                app.push_status(&format!("Cannot save policy: {err:#}"));
+                app.push_status(&format!("Cannot save template: {err:#}"));
             } else {
-                app.push_status("Select target storage class for policy");
+                app.push_status("Select target storage class for template");
             }
         }
         KeyCode::Char('?') => {
@@ -248,9 +253,8 @@ async fn handle_confirmation_keys(
                 match action {
                     PendingAction::Transition {
                         target_class,
-                        restore_first,
                     } => {
-                        execute_transition(app, s3, target_class, restore_first).await?;
+                        execute_transition(app, s3, target_class).await?;
                     }
                     PendingAction::Restore { days } => {
                         execute_restore(app, s3, days).await?;
@@ -258,25 +262,12 @@ async fn handle_confirmation_keys(
                     PendingAction::SavePolicy { target_class } => {
                         save_policy(app, policy_store, target_class)?;
                     }
+                    PendingAction::DeletePolicy { policy_index } => {
+                        delete_policy(app, policy_store, policy_index)?;
+                    }
                 }
             }
             app.set_mode(AppMode::Browsing);
-        }
-        KeyCode::Char('o') => {
-            let toggle_state = app.pending_action.as_mut().and_then(|action| match action {
-                PendingAction::Transition { restore_first, .. } => {
-                    *restore_first = !*restore_first;
-                    Some(*restore_first)
-                }
-                _ => None,
-            });
-            if let Some(state) = toggle_state {
-                app.push_status(if state {
-                    "Will request restore before transition"
-                } else {
-                    "Restore before transition disabled"
-                });
-            }
         }
         _ => {}
     }
@@ -375,9 +366,18 @@ fn handle_storage_class_selector(key: KeyEvent, app: &mut App) {
             if let Some(selected) = StorageClassTier::selectable().get(app.storage_class_cursor) {
                 match app.storage_intent {
                     StorageIntent::Transition => {
+                        // Check if objects need restore before transition
+                        if app.any_targets_need_restoration() {
+                            app.set_mode(AppMode::Browsing);
+                            let need_restore = app.count_objects_needing_restore();
+                            app.push_status(&format!(
+                                "⚠ {} objects require restore before transition. Press 'r' to restore them first.",
+                                need_restore
+                            ));
+                            return;
+                        }
                         app.pending_action = Some(PendingAction::Transition {
                             target_class: selected.clone(),
-                            restore_first: false,
                         });
                         app.set_mode(AppMode::Confirming);
                         app.push_status(&format!(
@@ -390,7 +390,7 @@ fn handle_storage_class_selector(key: KeyEvent, app: &mut App) {
                             target_class: selected.clone(),
                         });
                         app.set_mode(AppMode::Confirming);
-                        app.push_status("Confirm saving policy");
+                        app.push_status("Confirm saving template");
                     }
                 }
             }
@@ -400,18 +400,18 @@ fn handle_storage_class_selector(key: KeyEvent, app: &mut App) {
 }
 
 fn begin_storage_selection(app: &mut App, intent: StorageIntent) -> Result<()> {
-    if app.selected_bucket_name().is_none() {
-        anyhow::bail!("Select a bucket first");
-    }
     match intent {
         StorageIntent::Transition => {
+            if app.selected_bucket_name().is_none() {
+                anyhow::bail!("Select a bucket first");
+            }
             if target_count(app) == 0 {
                 anyhow::bail!("Select at least one object (mask or row)");
             }
         }
         StorageIntent::SavePolicy => {
             if app.active_mask.is_none() {
-                anyhow::bail!("Apply a mask before saving a policy");
+                anyhow::bail!("Apply a mask before saving a template");
             }
         }
     }
@@ -425,9 +425,30 @@ fn initiate_restore_flow(app: &mut App) -> Result<()> {
     if app.selected_bucket_name().is_none() || target_count(app) == 0 {
         anyhow::bail!("Select objects to restore first");
     }
+
+    let need_restore = app.count_objects_needing_restore();
+    let already_restoring = app.count_objects_restoring();
+
+    if need_restore == 0 {
+        if already_restoring > 0 {
+            app.push_status(&format!("{} objects are already being restored", already_restoring));
+        } else {
+            app.push_status("No objects need restore (not Glacier or already restored)");
+        }
+        return Ok(());
+    }
+
     app.pending_action = Some(PendingAction::Restore { days: 7 });
     app.set_mode(AppMode::Confirming);
-    app.push_status("Confirm restore request (Enter to proceed, Esc to cancel)");
+
+    if already_restoring > 0 {
+        app.push_status(&format!(
+            "Will restore {} objects ({} already restoring will be skipped)",
+            need_restore, already_restoring
+        ));
+    } else {
+        app.push_status(&format!("Confirm restore request for {} objects", need_restore));
+    }
     Ok(())
 }
 
@@ -435,7 +456,6 @@ async fn execute_transition(
     app: &mut App,
     s3: &S3Service,
     target_class: StorageClassTier,
-    restore_first: bool,
 ) -> Result<()> {
     let bucket = app
         .selected_bucket_name()
@@ -447,11 +467,6 @@ async fn execute_transition(
         return Ok(());
     }
     for key in keys {
-        if restore_first && let Err(err) = s3.request_restore(&bucket, &key, 7).await {
-            let detail = describe_restore_error(&err);
-            app.push_status(&format!("Restore failed for {key}: {detail}"));
-            continue;
-        }
         match s3
             .transition_storage_class(&bucket, &key, target_class.clone())
             .await
@@ -469,15 +484,67 @@ async fn execute_restore(app: &mut App, s3: &S3Service, days: i32) -> Result<()>
         .selected_bucket_name()
         .context("Select a bucket before restoring")?
         .to_string();
-    for key in target_keys(app) {
-        match s3.request_restore(&bucket, &key, days).await {
-            Ok(_) => app.push_status(&format!("Restore requested for {key}")),
-            Err(err) => {
-                let detail = describe_restore_error(&err);
-                app.push_status(&format!("Restore failed for {key}: {detail}"));
+
+    // Get objects and filter to only those needing restore
+    let all_keys = target_keys(app);
+    let objects_map: std::collections::HashMap<_, _> = if app.active_mask.is_some() {
+        app.filtered_objects.iter().map(|o| (o.key.clone(), o)).collect()
+    } else {
+        app.objects.iter().map(|o| (o.key.clone(), o)).collect()
+    };
+
+    let mut keys_to_restore = Vec::new();
+    let mut already_restoring = 0;
+    let mut already_available = 0;
+
+    for key in &all_keys {
+        if let Some(obj) = objects_map.get(key) {
+            match &obj.restore_state {
+                Some(crate::models::RestoreState::InProgress { .. }) => {
+                    already_restoring += 1;
+                }
+                Some(crate::models::RestoreState::Available) => {
+                    already_available += 1;
+                }
+                _ => {
+                    // Only restore if it's a Glacier object that needs restore
+                    if matches!(
+                        obj.storage_class,
+                        crate::models::StorageClassTier::GlacierFlexibleRetrieval
+                        | crate::models::StorageClassTier::GlacierDeepArchive
+                    ) {
+                        keys_to_restore.push(key.clone());
+                    }
+                }
             }
         }
     }
+
+    if already_restoring > 0 {
+        app.push_status(&format!("Skipped {} objects already being restored", already_restoring));
+    }
+    if already_available > 0 {
+        app.push_status(&format!("Skipped {} objects already restored", already_available));
+    }
+
+    if keys_to_restore.is_empty() {
+        app.push_status("No objects need restore");
+        return Ok(());
+    }
+
+    app.push_status(&format!("Requesting restore for {} objects...", keys_to_restore.len()));
+
+    for key in keys_to_restore {
+        match s3.request_restore(&bucket, &key, days).await {
+            Ok(_) => app.push_status(&format!("✓ Restore requested for {key}")),
+            Err(err) => {
+                let detail = describe_restore_error(&err);
+                app.push_status(&format!("✗ Restore failed for {key}: {detail}"));
+            }
+        }
+    }
+    // Reload objects to show updated restore status
+    load_objects_for_selection(app, s3).await?;
     Ok(())
 }
 
@@ -486,18 +553,14 @@ fn save_policy(
     store: &mut PolicyStore,
     target_class: StorageClassTier,
 ) -> Result<()> {
-    let bucket = app
-        .selected_bucket_name()
-        .context("Select a bucket before saving policy")?
-        .to_string();
     let mask = app
         .active_mask
         .clone()
-        .context("Apply a mask before saving policy")?;
-    let policy = MigrationPolicy::new(bucket, mask, target_class, false, None);
+        .context("Apply a mask before saving template")?;
+    let policy = MigrationPolicy::new(mask, target_class, None);
     store.add(policy.clone())?;
     app.policies = store.policies.clone();
-    app.push_status("Policy saved");
+    app.push_status("Template saved");
     Ok(())
 }
 
@@ -647,7 +710,7 @@ fn move_selection(app: &mut App, delta: isize) {
             }
             app.selected_object = idx as usize;
         }
-        ActivePane::Policies => {
+        ActivePane::Templates => {
             if app.policies.is_empty() {
                 return;
             }
@@ -686,7 +749,7 @@ fn jump_selection(app: &mut App, start: bool) {
                 };
             }
         }
-        ActivePane::Policies => {
+        ActivePane::Templates => {
             if !app.policies.is_empty() {
                 app.selected_policy = if start { 0 } else { app.policies.len() - 1 };
             }
@@ -741,39 +804,42 @@ fn target_keys(app: &App) -> Vec<String> {
 
 fn apply_selected_policy(app: &mut App) -> Result<()> {
     if app.policies.is_empty() {
-        anyhow::bail!("No policies available");
+        anyhow::bail!("No templates available");
     }
+
+    if app.selected_bucket_name().is_none() {
+        app.push_status("Select a bucket first to apply this template");
+        return Ok(());
+    }
+
     let policy = app
         .policies
         .get(app.selected_policy)
-        .context("Selected policy index out of bounds")?
+        .context("Selected template index out of bounds")?
         .clone();
-
-    // Check if the current bucket matches the policy bucket
-    if let Some(current_bucket) = app.selected_bucket_name() {
-        if current_bucket != policy.bucket {
-            app.push_status(&format!(
-                "Policy is for bucket '{}', but you have '{}' selected. Please select the correct bucket first.",
-                policy.bucket, current_bucket
-            ));
-            return Ok(());
-        }
-    } else {
-        app.push_status("Select a bucket first to apply this policy");
-        return Ok(());
-    }
 
     // Apply the mask
     app.apply_mask(Some(policy.mask.clone()));
 
+    // Check if any objects need restore before transition
+    let needs_restore = app.any_targets_need_restoration();
+
+    if needs_restore {
+        // Warn user and suggest restore first
+        app.push_status(&format!(
+            "⚠ Some objects in mask '{}' require restore before transition. Press 'r' to restore them first.",
+            policy.mask.name
+        ));
+        return Ok(());
+    }
+
     // Set up the pending action for storage class transition
     app.pending_action = Some(PendingAction::Transition {
         target_class: policy.target_storage_class.clone(),
-        restore_first: policy.restore_before_transition,
     });
     app.set_mode(AppMode::Confirming);
     app.push_status(&format!(
-        "Policy '{}' applied. Confirm to transition {} objects to {}",
+        "Template '{}' applied. Confirm to transition {} objects to {}",
         policy.mask.name,
         app.filtered_objects.len(),
         policy.target_storage_class.label()
@@ -783,12 +849,12 @@ fn apply_selected_policy(app: &mut App) -> Result<()> {
 
 fn load_policy_mask_for_editing(app: &mut App) -> Result<()> {
     if app.policies.is_empty() {
-        anyhow::bail!("No policies available");
+        anyhow::bail!("No templates available");
     }
     let policy = app
         .policies
         .get(app.selected_policy)
-        .context("Selected policy index out of bounds")?
+        .context("Selected template index out of bounds")?
         .clone();
 
     // Load the mask into the draft for editing
@@ -801,6 +867,37 @@ fn load_policy_mask_for_editing(app: &mut App) -> Result<()> {
     app.set_mode(AppMode::EditingMask);
     app.focus_mask_field(MaskEditorField::Name);
     app.push_status(&format!("Loaded mask '{}' for editing", policy.mask.name));
+    Ok(())
+}
+
+fn initiate_policy_delete(app: &mut App) {
+    if app.policies.is_empty() {
+        app.push_status("No templates to delete");
+        return;
+    }
+    if app.selected_policy >= app.policies.len() {
+        app.push_status("Invalid template selection");
+        return;
+    }
+    app.pending_action = Some(PendingAction::DeletePolicy {
+        policy_index: app.selected_policy,
+    });
+    app.set_mode(AppMode::Confirming);
+    app.push_status("Confirm template deletion");
+}
+
+fn delete_policy(
+    app: &mut App,
+    store: &mut PolicyStore,
+    policy_index: usize,
+) -> Result<()> {
+    store.remove(policy_index)?;
+    app.policies = store.policies.clone();
+    // Adjust selected_policy if necessary
+    if app.selected_policy >= app.policies.len() && !app.policies.is_empty() {
+        app.selected_policy = app.policies.len() - 1;
+    }
+    app.push_status("Template deleted");
     Ok(())
 }
 
@@ -971,19 +1068,35 @@ fn draw_objects(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             // Format storage class with fixed width
             let storage_label = format!("{:<20}", obj.storage_class.label());
 
-            // Get restore status symbol
-            let restore_symbol = match &obj.restore_state {
-                Some(RestoreState::Available) => " [✓]",
-                Some(RestoreState::InProgress { .. }) => " [⟳]",
-                Some(RestoreState::Expired) => " [✗]",
-                None => "    ",
-            };
-
-            let restore_style = match &obj.restore_state {
-                Some(RestoreState::Available) => Style::default().fg(Color::LightGreen),
-                Some(RestoreState::InProgress { .. }) => Style::default().fg(Color::Yellow),
-                Some(RestoreState::Expired) => Style::default().fg(Color::Red),
-                None => Style::default().fg(Color::DarkGray),
+            // Get restore status with more descriptive text
+            let (restore_symbol, restore_style) = match &obj.restore_state {
+                Some(RestoreState::Available) => (
+                    " Restored",
+                    Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)
+                ),
+                Some(RestoreState::InProgress { .. }) => (
+                    " Restoring",
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                ),
+                Some(RestoreState::Expired) => (
+                    " Expired",
+                    Style::default().fg(Color::Red)
+                ),
+                None => {
+                    // Check if object is in Glacier and needs restore
+                    if matches!(
+                        obj.storage_class,
+                        crate::models::StorageClassTier::GlacierFlexibleRetrieval
+                        | crate::models::StorageClassTier::GlacierDeepArchive
+                    ) {
+                        (
+                            " NeedsRestore",
+                            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)
+                        )
+                    } else {
+                        ("", Style::default().fg(Color::DarkGray))
+                    }
+                },
             };
 
             let spans = vec![
@@ -1088,11 +1201,11 @@ fn draw_policy_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         .add_modifier(Modifier::BOLD);
     let block = Block::default()
         .title(Span::styled(
-            "Policies – Enter apply, e edit mask",
+            "Templates – Enter apply, e edit, d delete",
             title_style,
         ))
         .borders(Borders::ALL)
-        .border_style(highlight_border(app.active_pane == ActivePane::Policies))
+        .border_style(highlight_border(app.active_pane == ActivePane::Templates))
         .style(Style::default().bg(Color::Black));
     let lines: Vec<Line> = app
         .policies
@@ -1108,25 +1221,30 @@ fn draw_policy_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            let text_style = if is_selected {
+
+            // Use different colors for different elements
+            let mask_style = if is_selected {
                 Style::default()
-                    .fg(Color::LightGreen)
+                    .fg(Color::LightCyan)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::Cyan)
             };
+
+            let storage_style = if is_selected {
+                Style::default()
+                    .fg(Color::LightYellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Yellow)
+            };
+
             Line::from(vec![
                 Span::styled(marker, marker_style),
                 Span::raw(" "),
-                Span::styled(
-                    format!(
-                        "{} -> {} ({})",
-                        policy.mask.name,
-                        policy.target_storage_class.label(),
-                        policy.bucket
-                    ),
-                    text_style,
-                ),
+                Span::styled(&policy.mask.name, mask_style),
+                Span::raw(" → "),
+                Span::styled(policy.target_storage_class.label(), storage_style),
             ])
         })
         .collect();
@@ -1167,7 +1285,7 @@ fn draw_command_bar(frame: &mut ratatui::Frame, area: Rect) {
         Span::styled(" s ", key_style),
         Span::raw("torage "),
         Span::styled(" p ", key_style),
-        Span::raw("olicy "),
+        Span::raw("template "),
         Span::styled(" r ", key_style),
         Span::raw("estore "),
         Span::styled(" i ", key_style),
@@ -1274,7 +1392,6 @@ fn draw_confirm_popup(frame: &mut ratatui::Frame, app: &App) {
         match action {
             PendingAction::Transition {
                 target_class,
-                restore_first,
             } => {
                 lines.push(Line::from(vec![Span::styled(
                     "Transition Storage Class",
@@ -1288,25 +1405,6 @@ fn draw_confirm_popup(frame: &mut ratatui::Frame, app: &App) {
                 lines.push(Line::from(vec![
                     Span::raw("  Target:  "),
                     Span::styled(target_class.label(), highlight_style),
-                ]));
-                lines.push(Line::from(""));
-                let restore_value = if *restore_first { "YES" } else { "NO" };
-                let restore_color = if *restore_first {
-                    Color::LightGreen
-                } else {
-                    Color::Gray
-                };
-                lines.push(Line::from(vec![
-                    Span::raw("  Restore first: "),
-                    Span::styled(
-                        restore_value,
-                        Style::default()
-                            .fg(restore_color)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw("  (press "),
-                    Span::styled("o", key_style),
-                    Span::raw(" to toggle)"),
                 ]));
             }
             PendingAction::Restore { days } => {
@@ -1326,18 +1424,46 @@ fn draw_confirm_popup(frame: &mut ratatui::Frame, app: &App) {
             }
             PendingAction::SavePolicy { target_class } => {
                 lines.push(Line::from(vec![Span::styled(
-                    "Save Migration Policy",
+                    "Save Migration Template",
                     warn_style,
                 )]));
                 lines.push(Line::from(""));
-                lines.push(Line::from(vec![
-                    Span::raw("  Bucket: "),
-                    Span::styled(app.selected_bucket_name().unwrap_or("n/a"), highlight_style),
-                ]));
+                if let Some(mask) = &app.active_mask {
+                    lines.push(Line::from(vec![
+                        Span::raw("  Mask:   "),
+                        Span::styled(&mask.name, highlight_style),
+                    ]));
+                }
                 lines.push(Line::from(vec![
                     Span::raw("  Target: "),
                     Span::styled(target_class.label(), highlight_style),
                 ]));
+            }
+            PendingAction::DeletePolicy { policy_index } => {
+                lines.push(Line::from(vec![Span::styled(
+                    "Delete Template",
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::BOLD),
+                )]));
+                lines.push(Line::from(""));
+                if let Some(policy) = app.policies.get(*policy_index) {
+                    lines.push(Line::from(vec![
+                        Span::raw("  Mask:   "),
+                        Span::styled(&policy.mask.name, highlight_style),
+                    ]));
+                    lines.push(Line::from(vec![
+                        Span::raw("  Target: "),
+                        Span::styled(policy.target_storage_class.label(), highlight_style),
+                    ]));
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(vec![Span::styled(
+                        "This action cannot be undone!",
+                        Style::default()
+                            .fg(Color::Red)
+                            .add_modifier(Modifier::BOLD),
+                    )]));
+                }
             }
         }
     }
@@ -1388,7 +1514,7 @@ fn draw_help_popup(frame: &mut ratatui::Frame) {
     let lines = vec![
         Line::from(vec![Span::styled("BASIC WORKFLOW", header_style)]),
         Line::from(
-            "1. Navigate with Tab/Shift+Tab to switch between panes (Buckets, Objects, Policies)",
+            "1. Navigate with Tab/Shift+Tab to switch between panes (Buckets, Objects, Templates)",
         ),
         Line::from("2. Select a bucket with arrows, press Enter to load its objects"),
         Line::from("3. Create a mask (press 'm') to filter objects by pattern"),
@@ -1405,7 +1531,7 @@ fn draw_help_popup(frame: &mut ratatui::Frame) {
         ]),
         Line::from(vec![
             Span::styled("Enter", key_style),
-            Span::raw(" - Load bucket objects (Buckets pane) or apply policy (Policies pane)"),
+            Span::raw(" - Load bucket objects (Buckets pane) or apply template (Templates pane)"),
         ]),
         Line::from(""),
         Line::from(vec![Span::styled("OBJECT FILTERING (MASKS)", header_style)]),
@@ -1439,21 +1565,26 @@ fn draw_help_popup(frame: &mut ratatui::Frame) {
             Span::raw(" - Inspect selected object (refreshes metadata via HeadObject)"),
         ]),
         Line::from(""),
-        Line::from(vec![Span::styled("POLICIES (SAVE & REUSE)", header_style)]),
+        Line::from(vec![Span::styled("TEMPLATES (SAVE & REUSE)", header_style)]),
         Line::from(vec![
             Span::styled("p", key_style),
-            Span::raw(" - Save current mask as a policy (stores mask + bucket + target class)"),
+            Span::raw(" - Save current mask as a template (stores mask + bucket + target class)"),
         ]),
-        Line::from("In Policies pane (use Tab to focus):"),
+        Line::from("In Templates pane (use Tab to focus):"),
         Line::from(vec![
             Span::raw("   "),
             Span::styled("Enter", key_style),
-            Span::raw(" - Apply selected policy (applies mask + transitions to saved class)"),
+            Span::raw(" - Apply selected template (applies mask + transitions to saved class)"),
         ]),
         Line::from(vec![
             Span::raw("   "),
             Span::styled("e", key_style),
-            Span::raw(" - Load policy mask into editor for modification before applying"),
+            Span::raw(" - Load template mask into editor for modification before applying"),
+        ]),
+        Line::from(vec![
+            Span::raw("   "),
+            Span::styled("d", key_style),
+            Span::raw(" - Delete selected template"),
         ]),
         Line::from(""),
         Line::from(vec![Span::styled("OTHER COMMANDS", header_style)]),
