@@ -4,6 +4,8 @@ use std::fmt;
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 
+use crate::models::StorageClassTier;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum MaskKind {
     Prefix,
@@ -30,6 +32,7 @@ pub struct ObjectMask {
     pub pattern: String,
     pub kind: MaskKind,
     pub case_sensitive: bool,
+    pub storage_class_filter: Option<StorageClassTier>,
 }
 
 impl ObjectMask {
@@ -43,15 +46,21 @@ impl ObjectMask {
     }
 
     pub fn summary(&self) -> String {
+        let pattern_display = if self.case_sensitive {
+            self.pattern.clone()
+        } else {
+            format!("{} (insensitive)", self.pattern)
+        };
+
+        let storage_filter = if let Some(ref storage) = self.storage_class_filter {
+            format!(" + {}", storage.label())
+        } else {
+            String::new()
+        };
+
         format!(
-            "{} ({:?}: {})",
-            self.name,
-            self.kind,
-            if self.case_sensitive {
-                self.pattern.clone()
-            } else {
-                format!("{} (insensitive)", self.pattern)
-            }
+            "{} ({:?}: {}{})",
+            self.name, self.kind, pattern_display, storage_filter
         )
     }
 

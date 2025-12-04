@@ -62,6 +62,21 @@ impl StorageClassTier {
         &Self::SELECTABLE
     }
 
+    /// Returns all storage classes with "Any" option for mask filtering
+    pub fn all_for_filter() -> Vec<(&'static str, Option<StorageClassTier>)> {
+        vec![
+            ("Any", None),
+            ("STANDARD", Some(StorageClassTier::Standard)),
+            ("INTELLIGENT_TIERING", Some(StorageClassTier::IntelligentTiering)),
+            ("STANDARD_IA", Some(StorageClassTier::StandardIa)),
+            ("ONEZONE_IA", Some(StorageClassTier::OneZoneIa)),
+            ("GLACIER_IR", Some(StorageClassTier::GlacierInstantRetrieval)),
+            ("GLACIER", Some(StorageClassTier::GlacierFlexibleRetrieval)),
+            ("DEEP_ARCHIVE", Some(StorageClassTier::GlacierDeepArchive)),
+            ("REDUCED_REDUNDANCY", Some(StorageClassTier::ReducedRedundancy)),
+        ]
+    }
+
     pub fn label(&self) -> &str {
         match self {
             StorageClassTier::Standard => "STANDARD",

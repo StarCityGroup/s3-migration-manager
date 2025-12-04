@@ -1,4 +1,4 @@
-use std::io::{self, Stdout};
+use std::io::{self, IsTerminal, Stdout};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -24,6 +24,15 @@ use crate::models::{RestoreState, StorageClassTier};
 use crate::tracker::RestoreTracker;
 
 pub async fn run(app: &mut App, s3: &S3Service, mut tracker: RestoreTracker) -> Result<()> {
+    // Verify we have a terminal before trying to initialize TUI
+    if !io::stdout().is_terminal() {
+        anyhow::bail!(
+            "This application requires a terminal to run.\n\
+             stdout is not connected to a terminal (TTY).\n\
+             Please run this application directly in a terminal."
+        );
+    }
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -181,6 +190,16 @@ async fn handle_key_event(
         }
         KeyCode::Up => move_selection(app, -1),
         KeyCode::Down => move_selection(app, 1),
+        KeyCode::Left => {
+            if app.active_pane == ActivePane::Buckets {
+                cycle_region(app, -1);
+            }
+        }
+        KeyCode::Right => {
+            if app.active_pane == ActivePane::Buckets {
+                cycle_region(app, 1);
+            }
+        }
         KeyCode::PageUp => move_selection(app, -5),
         KeyCode::PageDown => move_selection(app, 5),
         KeyCode::Home => jump_selection(app, true),
@@ -238,12 +257,6 @@ async fn handle_key_event(
             } else {
                 app.set_mode(AppMode::ViewingRestoreRequests);
             }
-        }
-        KeyCode::Char('[') => {
-            cycle_region(app, -1);
-        }
-        KeyCode::Char(']') => {
-            cycle_region(app, 1);
         }
         KeyCode::Esc => {
             if app.active_mask.is_some() {
@@ -304,6 +317,7 @@ fn handle_mask_editor_keys(key: KeyEvent, app: &mut App) {
                 pattern: app.mask_draft.pattern.clone(),
                 kind: app.mask_draft.kind.clone(),
                 case_sensitive: app.mask_draft.case_sensitive,
+                storage_class_filter: app.mask_draft.storage_class_filter.clone(),
             };
             app.apply_mask(Some(mask));
             app.set_mode(AppMode::Browsing);
@@ -337,6 +351,15 @@ fn handle_mask_editor_keys(key: KeyEvent, app: &mut App) {
             }
             MaskEditorField::Mode => app.cycle_mask_kind_backwards(),
             MaskEditorField::Case => app.toggle_mask_case(),
+            MaskEditorField::StorageClass => {
+                if app.mask_draft.storage_class_cursor > 0 {
+                    app.mask_draft.storage_class_cursor -= 1;
+                }
+                let all_classes = StorageClassTier::all_for_filter();
+                app.mask_draft.storage_class_filter = all_classes
+                    .get(app.mask_draft.storage_class_cursor)
+                    .and_then(|(_, filter)| filter.clone());
+            }
         },
         KeyCode::Right => match app.mask_field {
             MaskEditorField::Pattern => {
@@ -346,6 +369,15 @@ fn handle_mask_editor_keys(key: KeyEvent, app: &mut App) {
             }
             MaskEditorField::Mode => app.cycle_mask_kind(),
             MaskEditorField::Case => app.toggle_mask_case(),
+            MaskEditorField::StorageClass => {
+                let all_classes = StorageClassTier::all_for_filter();
+                if app.mask_draft.storage_class_cursor + 1 < all_classes.len() {
+                    app.mask_draft.storage_class_cursor += 1;
+                }
+                app.mask_draft.storage_class_filter = all_classes
+                    .get(app.mask_draft.storage_class_cursor)
+                    .and_then(|(_, filter)| filter.clone());
+            }
         },
         KeyCode::Home => {
             if matches!(app.mask_field, MaskEditorField::Pattern) {
@@ -360,6 +392,14 @@ fn handle_mask_editor_keys(key: KeyEvent, app: &mut App) {
         KeyCode::Char(' ') => match app.mask_field {
             MaskEditorField::Mode => app.cycle_mask_kind(),
             MaskEditorField::Case => app.toggle_mask_case(),
+            MaskEditorField::StorageClass => {
+                let all_classes = StorageClassTier::all_for_filter();
+                app.mask_draft.storage_class_cursor =
+                    (app.mask_draft.storage_class_cursor + 1) % all_classes.len();
+                app.mask_draft.storage_class_filter = all_classes
+                    .get(app.mask_draft.storage_class_cursor)
+                    .and_then(|(_, filter)| filter.clone());
+            }
             MaskEditorField::Pattern => {
                 app.mask_draft
                     .pattern
@@ -936,15 +976,15 @@ fn draw_bucket_selector(frame: &mut ratatui::Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        Span::styled("[", key_style),
-        Span::styled("]", key_style),
-        Span::raw("◀▶  │  "),
+        Span::styled("←", key_style),
+        Span::styled("→", key_style),
+        Span::raw(" cycle  │  "),
         Span::styled("Bucket: ", Style::default().fg(Color::Cyan)),
         Span::styled(bucket_name, title_style),
         Span::raw(bucket_info),
         Span::styled("↑", key_style),
         Span::styled("↓", key_style),
-        Span::raw(" navigate"),
+        Span::raw(" select"),
     ]);
 
     let para = Paragraph::new(text).block(block);
@@ -1209,10 +1249,10 @@ fn draw_command_bar(frame: &mut ratatui::Frame, area: Rect) {
         Span::raw("estore "),
         Span::styled(" i ", key_style),
         Span::raw("nfo "),
-        Span::styled(" [ ] ", key_style),
-        Span::raw("egion "),
         Span::styled(" f ", key_style),
         Span::raw("refresh "),
+        Span::styled(" t ", key_style),
+        Span::raw("racker "),
         Span::styled(" ? ", key_style),
         Span::raw("help "),
         Span::styled(" l ", key_style),
@@ -1337,6 +1377,30 @@ fn draw_mask_popup(frame: &mut ratatui::Frame, app: &App) {
                 },
             ),
             Span::styled("  (space or ←/→ toggles)", hint_style),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "Storage Class: ",
+                if matches!(app.mask_field, MaskEditorField::StorageClass) {
+                    active_style
+                } else {
+                    label_style
+                },
+            ),
+            Span::styled(
+                app.mask_draft
+                    .storage_class_filter
+                    .as_ref()
+                    .map(|s| s.label())
+                    .unwrap_or("Any"),
+                if matches!(app.mask_field, MaskEditorField::StorageClass) {
+                    active_style
+                } else {
+                    inactive_style
+                },
+            ),
+            Span::styled("  (use ←/→ or space)", hint_style),
         ]),
         Line::from(""),
         Line::from(""),

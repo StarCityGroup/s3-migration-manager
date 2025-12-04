@@ -34,6 +34,7 @@ pub enum MaskEditorField {
     Pattern,
     Mode,
     Case,
+    StorageClass,
 }
 
 impl MaskEditorField {
@@ -41,15 +42,17 @@ impl MaskEditorField {
         match self {
             MaskEditorField::Pattern => MaskEditorField::Mode,
             MaskEditorField::Mode => MaskEditorField::Case,
-            MaskEditorField::Case => MaskEditorField::Pattern,
+            MaskEditorField::Case => MaskEditorField::StorageClass,
+            MaskEditorField::StorageClass => MaskEditorField::Pattern,
         }
     }
 
     pub fn previous(self) -> Self {
         match self {
-            MaskEditorField::Pattern => MaskEditorField::Case,
+            MaskEditorField::Pattern => MaskEditorField::StorageClass,
             MaskEditorField::Mode => MaskEditorField::Pattern,
             MaskEditorField::Case => MaskEditorField::Mode,
+            MaskEditorField::StorageClass => MaskEditorField::Case,
         }
     }
 }
@@ -59,6 +62,8 @@ pub struct MaskDraft {
     pub pattern: String,
     pub kind: MaskKind,
     pub case_sensitive: bool,
+    pub storage_class_filter: Option<StorageClassTier>,
+    pub storage_class_cursor: usize,
     pub cursor_pos: usize,
 }
 
@@ -68,6 +73,8 @@ impl Default for MaskDraft {
             pattern: String::new(),
             kind: MaskKind::Prefix,
             case_sensitive: false,
+            storage_class_filter: None,
+            storage_class_cursor: 0,
             cursor_pos: 0,
         }
     }
@@ -262,7 +269,19 @@ impl App {
             self.filtered_objects = self
                 .objects
                 .iter()
-                .filter(|&obj| mask.matches(&obj.key))
+                .filter(|&obj| {
+                    // Filter by key pattern
+                    let key_matches = mask.matches(&obj.key);
+
+                    // Filter by storage class if specified
+                    let storage_matches = mask
+                        .storage_class_filter
+                        .as_ref()
+                        .map(|filter| &obj.storage_class == filter)
+                        .unwrap_or(true); // If no filter, all storage classes match
+
+                    key_matches && storage_matches
+                })
                 .cloned()
                 .collect();
             self.selected_object = 0;
