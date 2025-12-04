@@ -21,8 +21,9 @@ use crate::app::{ActivePane, App, AppMode, MaskEditorField, PendingAction, Stora
 use crate::aws::S3Service;
 use crate::mask::ObjectMask;
 use crate::models::{RestoreState, StorageClassTier};
+use crate::tracker::RestoreTracker;
 
-pub async fn run(app: &mut App, s3: &S3Service) -> Result<()> {
+pub async fn run(app: &mut App, s3: &S3Service, mut tracker: RestoreTracker) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -47,7 +48,7 @@ pub async fn run(app: &mut App, s3: &S3Service) -> Result<()> {
         }
     }
 
-    let result = event_loop(&mut terminal, app, s3).await;
+    let result = event_loop(&mut terminal, app, s3, &mut tracker).await;
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
@@ -58,12 +59,13 @@ async fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
     s3: &S3Service,
+    tracker: &mut RestoreTracker,
 ) -> Result<()> {
     let mut last_refresh = std::time::Instant::now();
     let refresh_interval = Duration::from_secs(30);
 
     loop {
-        terminal.draw(|frame| draw(frame, app))?;
+        terminal.draw(|frame| draw(frame, app, tracker))?;
 
         // Check if we should auto-load objects for selected bucket
         if app.pending_bucket_load
@@ -73,6 +75,9 @@ async fn event_loop(
             app.pending_bucket_load = false;
             if let Err(err) = load_objects_for_selection(app, s3).await {
                 app.push_status(&format!("Failed to load objects: {err:#}"));
+            } else {
+                // Automatically switch to Objects pane after successful load
+                app.active_pane = ActivePane::Objects;
             }
         }
 
@@ -96,7 +101,7 @@ async fn event_loop(
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
                 Event::Key(key) => {
-                    if handle_key_event(key, app, s3).await? {
+                    if handle_key_event(key, app, s3, tracker).await? {
                         break;
                     }
                 }
@@ -108,7 +113,12 @@ async fn event_loop(
     Ok(())
 }
 
-async fn handle_key_event(key: KeyEvent, app: &mut App, s3: &S3Service) -> Result<bool> {
+async fn handle_key_event(
+    key: KeyEvent,
+    app: &mut App,
+    s3: &S3Service,
+    tracker: &mut RestoreTracker,
+) -> Result<bool> {
     if key.kind != KeyEventKind::Press {
         return Ok(false);
     }
@@ -137,6 +147,15 @@ async fn handle_key_event(key: KeyEvent, app: &mut App, s3: &S3Service) -> Resul
             }
             return Ok(false);
         }
+        AppMode::ViewingRestoreRequests => {
+            if matches!(
+                key.code,
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('t') | KeyCode::Char('T')
+            ) {
+                app.set_mode(AppMode::Browsing);
+            }
+            return Ok(false);
+        }
         AppMode::EditingMask => {
             handle_mask_editor_keys(key, app);
             return Ok(false);
@@ -146,7 +165,7 @@ async fn handle_key_event(key: KeyEvent, app: &mut App, s3: &S3Service) -> Resul
             return Ok(false);
         }
         AppMode::Confirming => {
-            handle_confirmation_keys(key, app, s3).await?;
+            handle_confirmation_keys(key, app, s3, tracker).await?;
             return Ok(false);
         }
         AppMode::Browsing => {}
@@ -189,6 +208,8 @@ async fn handle_key_event(key: KeyEvent, app: &mut App, s3: &S3Service) -> Resul
         KeyCode::Enter => {
             if app.active_pane == ActivePane::Buckets {
                 load_objects_for_selection(app, s3).await?;
+                // Automatically switch to Objects pane for intuitive navigation
+                app.active_pane = ActivePane::Objects;
             }
         }
         KeyCode::Char('s') => {
@@ -211,6 +232,13 @@ async fn handle_key_event(key: KeyEvent, app: &mut App, s3: &S3Service) -> Resul
                 app.set_mode(AppMode::ViewingLog);
             }
         }
+        KeyCode::Char('t') | KeyCode::Char('T') => {
+            if matches!(app.mode, AppMode::ViewingRestoreRequests) {
+                app.set_mode(AppMode::Browsing);
+            } else {
+                app.set_mode(AppMode::ViewingRestoreRequests);
+            }
+        }
         KeyCode::Char('[') => {
             cycle_region(app, -1);
         }
@@ -228,7 +256,12 @@ async fn handle_key_event(key: KeyEvent, app: &mut App, s3: &S3Service) -> Resul
     Ok(false)
 }
 
-async fn handle_confirmation_keys(key: KeyEvent, app: &mut App, s3: &S3Service) -> Result<()> {
+async fn handle_confirmation_keys(
+    key: KeyEvent,
+    app: &mut App,
+    s3: &S3Service,
+    tracker: &mut RestoreTracker,
+) -> Result<()> {
     match key.code {
         KeyCode::Esc | KeyCode::Char('n') => {
             app.pending_action = None;
@@ -242,7 +275,7 @@ async fn handle_confirmation_keys(key: KeyEvent, app: &mut App, s3: &S3Service) 
                         execute_transition(app, s3, target_class).await?;
                     }
                     PendingAction::Restore { days } => {
-                        execute_restore(app, s3, days).await?;
+                        execute_restore(app, s3, tracker, days).await?;
                     }
                 }
             }
@@ -470,7 +503,12 @@ async fn execute_transition(
     Ok(())
 }
 
-async fn execute_restore(app: &mut App, s3: &S3Service, days: i32) -> Result<()> {
+async fn execute_restore(
+    app: &mut App,
+    s3: &S3Service,
+    tracker: &mut RestoreTracker,
+    days: i32,
+) -> Result<()> {
     let bucket = app
         .selected_bucket_name()
         .context("Select a bucket before restoring")?
@@ -542,6 +580,8 @@ async fn execute_restore(app: &mut App, s3: &S3Service, days: i32) -> Result<()>
         match s3.request_restore(&bucket, &key, days).await {
             Ok(_) => {
                 app.push_status(&format!("✓ Restore requested for {key}"));
+                // Track the restore request
+                tracker.add_request(bucket.clone(), key.clone(), days);
                 restored_keys.push(key);
             }
             Err(err) => {
@@ -603,20 +643,13 @@ async fn load_objects_for_selection(app: &mut App, s3: &S3Service) -> Result<()>
     if let Some(bucket) = app.selected_bucket_name().map(|b| b.to_string()) {
         app.reset_pagination();
         app.is_loading_objects = true;
-        app.push_status(&format!("Counting objects in {}...", bucket));
+        app.push_status(&format!("Loading objects from {}...", bucket));
 
-        // First, get total count (fast)
-        match s3.count_objects(&bucket, None).await {
-            Ok(count) => {
-                app.total_object_count = Some(count);
-                app.push_status(&format!("Found {} objects total", count));
-            }
-            Err(err) => {
-                app.push_status(&format!("Count failed: {err:#}"));
-            }
-        }
+        // Skip full count for now - it can take forever on large buckets
+        // We'll show loaded count vs "more available" instead
+        app.total_object_count = None;
 
-        // Then load first page
+        // Load first page
         const PAGE_SIZE: i32 = 200;
         match s3
             .list_objects_paginated(&bucket, None, None, PAGE_SIZE)
@@ -629,8 +662,11 @@ async fn load_objects_for_selection(app: &mut App, s3: &S3Service) -> Result<()>
                 app.apply_mask(app.active_mask.clone());
 
                 let loaded = app.objects.len();
-                let total = app.total_object_count.unwrap_or(loaded);
-                app.push_status(&format!("Loaded {} of {} objects", loaded, total));
+                if app.has_more_objects() {
+                    app.push_status(&format!("Loaded {} objects (more available)", loaded));
+                } else {
+                    app.push_status(&format!("Loaded all {} objects", loaded));
+                }
 
                 // Fetch restore status for Glacier objects
                 refresh_glacier_restore_status(app, s3, &bucket).await;
@@ -664,11 +700,10 @@ async fn load_more_objects(app: &mut App, s3: &S3Service) -> Result<()> {
                 app.continuation_token = next_token;
 
                 let loaded = app.objects.len();
-                let total = app.total_object_count.unwrap_or(loaded);
                 if app.has_more_objects() {
-                    app.push_status(&format!("Loaded {} of {} objects...", loaded, total));
+                    app.push_status(&format!("Loaded {} objects (more available)...", loaded));
                 } else {
-                    app.push_status(&format!("Loaded all {} objects", total));
+                    app.push_status(&format!("Loaded all {} objects", loaded));
                 }
 
                 // Fetch restore status for newly loaded Glacier objects
@@ -831,7 +866,7 @@ fn target_keys(app: &App) -> Vec<String> {
     }
 }
 
-fn draw(frame: &mut ratatui::Frame, app: &App) {
+fn draw(frame: &mut ratatui::Frame, app: &App, tracker: &RestoreTracker) {
     let size = frame.size();
 
     // Main vertical split: content area, status, command bar
@@ -869,6 +904,7 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
         AppMode::Confirming => draw_confirm_popup(frame, app),
         AppMode::ShowingHelp => draw_help_popup(frame),
         AppMode::ViewingLog => draw_log_popup(frame, app),
+        AppMode::ViewingRestoreRequests => draw_tracked_requests_popup(frame, tracker),
         AppMode::Browsing => {}
     }
 }
@@ -1535,6 +1571,69 @@ fn draw_log_popup(frame: &mut ratatui::Frame, app: &App) {
     if lines.is_empty() {
         lines.push(Line::from("No status messages yet."));
     }
+    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
+    frame.render_widget(para, area);
+}
+
+fn draw_tracked_requests_popup(frame: &mut ratatui::Frame, tracker: &RestoreTracker) {
+    let area = centered_rect(80, 70, frame.size());
+    draw_modal_surface(frame, area);
+
+    let block = Block::default()
+        .title("Tracked Restore Requests – Esc/t/Enter to close")
+        .borders(Borders::ALL)
+        .style(Style::default().bg(Color::Black));
+
+    let requests = tracker.get_all_requests();
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Bucket", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" | "),
+            Span::styled("Object Key", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" | "),
+            Span::styled("Status", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" | "),
+            Span::styled("Days", Style::default().add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(std::iter::repeat('-').take(100).collect::<String>()),
+    ];
+
+    if requests.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from("No restore requests tracked yet."));
+        lines.push(Line::from(""));
+        lines.push(Line::from("Restore requests will appear here after you initiate them."));
+    } else {
+        for req in requests {
+            let status_text = match &req.current_status {
+                RestoreState::InProgress { expiry } => {
+                    if let Some(exp) = expiry {
+                        format!("In Progress (exp: {})", exp)
+                    } else {
+                        "In Progress".to_string()
+                    }
+                }
+                RestoreState::Available => "Available".to_string(),
+                RestoreState::Expired => "Expired".to_string(),
+            };
+
+            let status_style = match &req.current_status {
+                RestoreState::InProgress { .. } => Style::default().fg(Color::Yellow),
+                RestoreState::Available => Style::default().fg(Color::Green),
+                RestoreState::Expired => Style::default().fg(Color::Red),
+            };
+
+            lines.push(Line::from(vec![
+                Span::raw(format!("{} | ", req.bucket)),
+                Span::raw(format!("{} | ", req.key)),
+                Span::styled(format!("{} | ", status_text), status_style),
+                Span::raw(format!("{} days", req.days)),
+            ]));
+        }
+    }
+
     let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
     frame.render_widget(para, area);
 }

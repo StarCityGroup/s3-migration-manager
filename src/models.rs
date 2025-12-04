@@ -10,6 +10,15 @@ pub struct BucketInfo {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TrackedRestoreRequest {
+    pub bucket: String,
+    pub key: String,
+    pub requested_at: String, // ISO 8601 timestamp
+    pub days: i32,
+    pub current_status: RestoreState,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ObjectInfo {
     pub key: String,
     pub size: i64,

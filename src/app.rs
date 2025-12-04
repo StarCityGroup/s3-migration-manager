@@ -20,6 +20,7 @@ pub enum AppMode {
     SelectingStorageClass,
     ShowingHelp,
     ViewingLog,
+    ViewingRestoreRequests,
     CredentialError,
 }
 

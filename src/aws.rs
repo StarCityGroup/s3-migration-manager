@@ -60,32 +60,6 @@ impl S3Service {
             .or(Some("us-east-1".to_string())))
     }
 
-    /// Count total objects in bucket without loading full details (fast)
-    pub async fn count_objects(&self, bucket: &str, prefix: Option<&str>) -> Result<usize> {
-        let mut continuation_token: Option<String> = None;
-        let mut total_count = 0;
-        loop {
-            let mut request = self.client.list_objects_v2().bucket(bucket);
-            if let Some(token) = &continuation_token {
-                request = request.continuation_token(token);
-            }
-            if let Some(pref) = prefix {
-                request = request.prefix(pref);
-            }
-            let response = request.send().await?;
-            total_count += response.key_count().unwrap_or(0) as usize;
-
-            if response.is_truncated().unwrap_or(false) {
-                continuation_token = response
-                    .next_continuation_token()
-                    .map(|token| token.to_string());
-            } else {
-                break;
-            }
-        }
-        Ok(total_count)
-    }
-
     /// Load a page of objects with optional continuation token
     pub async fn list_objects_paginated(
         &self,
