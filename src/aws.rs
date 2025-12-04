@@ -7,13 +7,19 @@ use crate::models::{BucketInfo, ObjectInfo, RestoreState, StorageClassTier};
 
 pub struct S3Service {
     client: Client,
+    region: Option<String>,
 }
 
 impl S3Service {
     pub async fn new() -> Result<Self> {
         let config = aws_config::from_env().load().await;
+        let region = config.region().map(|r| r.as_ref().to_string());
         let client = Client::new(&config);
-        Ok(Self { client })
+        Ok(Self { client, region })
+    }
+
+    pub fn region(&self) -> Option<&str> {
+        self.region.as_deref()
     }
 
     pub async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {

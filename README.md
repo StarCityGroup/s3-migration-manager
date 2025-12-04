@@ -1,4 +1,4 @@
-# S3 Migration Manager
+# Bucket Brigade
 
 Terminal UI for browsing S3 buckets, defining object masks, and managing storage tier transitions or restores without leaving the shell.
 
@@ -11,7 +11,7 @@ Terminal UI for browsing S3 buckets, defining object masks, and managing storage
 - **Smart pagination**: automatically loads more objects when scrolling near the end or when masks need more matches.
 - **Storage class transitions**: interactively choose a target tier; confirmations include an option to request restores before the copy operation.
 - **Restore workflow**: request temporary Glacier restores (default 7 days) for the current selection.
-- **Policy library**: persist mask + target-class rules to `~/.config/s3-migration-manager/policies.json` for later reuse or auditing.
+- **Policy library**: persist mask + target-class rules to `~/.config/bucket-brigade/policies.json` for later reuse or auditing.
 - **Deep storage visibility**: refresh metadata for any object to fetch its latest restore status before acting.
 - **Structured object list**: fixed-width columns with restore status indicators (✓ available, ⟳ in progress, ✗ expired).
 
@@ -135,7 +135,7 @@ Policies save your mask + target storage class for reuse:
 2. Select the bucket you want to use
 3. Press `p` to save as policy
 4. Choose the target storage class
-5. Confirm - policy is saved to `~/.config/s3-migration-manager/policies.json`
+5. Confirm - policy is saved to `~/.config/bucket-brigade/policies.json`
 
 #### Using Saved Policies
 
@@ -167,7 +167,7 @@ Navigate to the Policies pane (press `Tab` until focused), then:
 
 ## Storage Policies
 
-Saved policies live at `~/.config/s3-migration-manager/policies.json`. Each entry records:
+Saved policies live at `~/.config/bucket-brigade/policies.json`. Each entry records:
 
 - Bucket name
 - Mask definition

@@ -1,4 +1,4 @@
-# S3 Migration Manager - Development Guide
+# Bucket Brigade - Development Guide
 
 This is a terminal-based S3 migration manager built with Rust. It provides an interactive TUI for browsing S3 buckets, defining object masks, and managing storage tier transitions.
 
@@ -23,7 +23,7 @@ cargo run
 cargo build --release
 
 # Run the release binary
-./target/release/s3-migration-manager
+./target/release/bucket-brigade
 ```
 
 ## Development Workflow
@@ -117,7 +117,7 @@ The application uses the AWS SDK's default credential chain. Ensure one of the f
 ## Project Structure
 
 ```
-s3-migration-manager/
+bucket-brigade/
 ├── src/
 │   ├── main.rs         # Application entry point
 │   ├── app.rs          # Core application state and logic
@@ -164,7 +164,7 @@ s3-migration-manager/
 - StorageClassTier: STANDARD, STANDARD_IA, GLACIER, etc.
 
 ### `policy.rs`
-- PolicyStore: Loads/saves to `~/.config/s3-migration-manager/policies.json`
+- PolicyStore: Loads/saves to `~/.config/bucket-brigade/policies.json`
 - MigrationPolicy: Reusable mask + target class + restore settings
 - JSON serialization via serde
 
@@ -200,7 +200,7 @@ s3-migration-manager/
 ## Configuration Files
 
 ### User Configuration
-- **Location**: `~/.config/s3-migration-manager/policies.json`
+- **Location**: `~/.config/bucket-brigade/policies.json`
 - **Format**: JSON array of MigrationPolicy objects
 - **Created**: Automatically on first policy save
 

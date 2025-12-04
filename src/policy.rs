@@ -95,7 +95,7 @@ impl PolicyStore {
 }
 
 fn default_store_path() -> Result<PathBuf> {
-    let dirs = ProjectDirs::from("com", "s3-migration-manager", "s3-migration-manager")
+    let dirs = ProjectDirs::from("com", "bucket-brigade", "bucket-brigade")
         .context("could not resolve configuration directory")?;
     Ok(dirs.config_dir().join("policies.json"))
 }

@@ -22,6 +22,7 @@ pub enum AppMode {
     SelectingStorageClass,
     ShowingHelp,
     ViewingLog,
+    CredentialError,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

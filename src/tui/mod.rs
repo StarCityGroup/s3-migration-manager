@@ -33,7 +33,18 @@ pub async fn run(app: &mut App, s3: &S3Service, policy_store: &mut PolicyStore) 
 
     app.push_status("Loading buckets…");
     if let Err(err) = refresh_buckets(app, s3).await {
-        app.push_status(&format!("Failed to load buckets: {err:#}"));
+        // Check if this is a credentials error
+        let err_msg = format!("{err:#}");
+        if err_msg.contains("credentials")
+            || err_msg.contains("UnrecognizedClientException")
+            || err_msg.contains("InvalidAccessKeyId")
+            || err_msg.contains("SignatureDoesNotMatch")
+            || err_msg.contains("NoCredentialsError") {
+            app.set_mode(AppMode::CredentialError);
+            app.push_status(&format!("AWS credentials error: {err_msg}"));
+        } else {
+            app.push_status(&format!("Failed to load buckets: {err:#}"));
+        }
     }
 
     let result = event_loop(&mut terminal, app, s3, policy_store).await;
@@ -113,6 +124,10 @@ async fn handle_key_event(
     }
 
     match app.mode {
+        AppMode::CredentialError => {
+            // Any key press exits the application
+            return Ok(true);
+        }
         AppMode::ShowingHelp => {
             if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?')) {
                 app.set_mode(AppMode::Browsing);
@@ -940,6 +955,7 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     draw_command_bar(frame, vertical[2]);
 
     match app.mode {
+        AppMode::CredentialError => draw_credential_error_popup(frame),
         AppMode::EditingMask => draw_mask_popup(frame, app),
         AppMode::SelectingStorageClass => draw_storage_popup(frame, app),
         AppMode::Confirming => draw_confirm_popup(frame, app),
@@ -1624,6 +1640,63 @@ fn draw_log_popup(frame: &mut ratatui::Frame, app: &App) {
     if lines.is_empty() {
         lines.push(Line::from("No status messages yet."));
     }
+    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
+    frame.render_widget(para, area);
+}
+
+fn draw_credential_error_popup(frame: &mut ratatui::Frame) {
+    let area = centered_rect(70, 50, frame.size());
+    draw_modal_surface(frame, area);
+
+    let error_style = Style::default()
+        .fg(Color::Red)
+        .add_modifier(Modifier::BOLD);
+    let title_style = Style::default()
+        .fg(Color::LightYellow)
+        .add_modifier(Modifier::BOLD);
+    let key_style = Style::default()
+        .bg(Color::LightYellow)
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD);
+
+    let block = Block::default()
+        .title(Span::styled(" AWS Credentials Error ", title_style))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .style(Style::default().bg(Color::Black));
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "⚠ Failed to authenticate with AWS",
+            error_style,
+        )]),
+        Line::from(""),
+        Line::from("The application could not access AWS S3. This usually means:"),
+        Line::from(""),
+        Line::from("  • AWS credentials are not configured"),
+        Line::from("  • Credentials have expired (SSO)"),
+        Line::from("  • Invalid access key or secret key"),
+        Line::from("  • Missing AWS_PROFILE environment variable"),
+        Line::from(""),
+        Line::from(vec![Span::styled("To fix this:", title_style)]),
+        Line::from(""),
+        Line::from("  1. Configure AWS credentials in ~/.aws/credentials"),
+        Line::from("  2. Set AWS_PROFILE environment variable"),
+        Line::from("  3. Run 'aws sso login' if using SSO"),
+        Line::from("  4. Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"),
+        Line::from(""),
+        Line::from("For more information:"),
+        Line::from("  https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-files.html"),
+        Line::from(""),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("Press "),
+            Span::styled(" any key ", key_style),
+            Span::raw(" to exit"),
+        ]),
+    ];
+
     let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
     frame.render_widget(para, area);
 }

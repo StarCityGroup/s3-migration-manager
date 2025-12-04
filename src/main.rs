@@ -17,6 +17,12 @@ async fn main() -> Result<()> {
     let existing_policies = policy_store.policies.clone();
     let mut app = App::new(existing_policies);
     let s3 = S3Service::new().await?;
+
+    // Set the initial region to the user's default AWS region
+    if let Some(region) = s3.region() {
+        app.set_region(Some(region.to_string()));
+    }
+
     if let Err(err) = tui::run(&mut app, &s3, &mut policy_store).await {
         eprintln!("Application error: {err:#}");
     }

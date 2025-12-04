@@ -1,5 +1,5 @@
 [package]
-name = "s3-migration-manager"
+name = "bucket-brigade"
 version = "0.1.0"
 edition = "2024"
 
