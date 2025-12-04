@@ -30,7 +30,6 @@ pub enum StorageIntent {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MaskEditorField {
-    Name,
     Pattern,
     Mode,
     Case,
@@ -39,17 +38,15 @@ pub enum MaskEditorField {
 impl MaskEditorField {
     pub fn next(self) -> Self {
         match self {
-            MaskEditorField::Name => MaskEditorField::Pattern,
             MaskEditorField::Pattern => MaskEditorField::Mode,
             MaskEditorField::Mode => MaskEditorField::Case,
-            MaskEditorField::Case => MaskEditorField::Name,
+            MaskEditorField::Case => MaskEditorField::Pattern,
         }
     }
 
     pub fn previous(self) -> Self {
         match self {
-            MaskEditorField::Name => MaskEditorField::Case,
-            MaskEditorField::Pattern => MaskEditorField::Name,
+            MaskEditorField::Pattern => MaskEditorField::Case,
             MaskEditorField::Mode => MaskEditorField::Pattern,
             MaskEditorField::Case => MaskEditorField::Mode,
         }
@@ -58,19 +55,19 @@ impl MaskEditorField {
 
 #[derive(Clone, Debug)]
 pub struct MaskDraft {
-    pub name: String,
     pub pattern: String,
     pub kind: MaskKind,
     pub case_sensitive: bool,
+    pub cursor_pos: usize,
 }
 
 impl Default for MaskDraft {
     fn default() -> Self {
         Self {
-            name: "Untitled mask".into(),
             pattern: String::new(),
             kind: MaskKind::Prefix,
             case_sensitive: false,
+            cursor_pos: 0,
         }
     }
 }
@@ -147,7 +144,7 @@ impl App {
             pending_action: None,
             storage_class_cursor: 0,
             storage_intent: StorageIntent::Transition,
-            mask_field: MaskEditorField::Name,
+            mask_field: MaskEditorField::Pattern,
             last_bucket_change: None,
             pending_bucket_load: false,
             total_object_count: None,

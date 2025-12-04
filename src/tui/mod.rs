@@ -171,9 +171,11 @@ async fn handle_key_event(
         KeyCode::End => jump_selection(app, false),
         KeyCode::Char('m') => {
             app.set_mode(AppMode::EditingMask);
-            app.focus_mask_field(MaskEditorField::Name);
+            app.focus_mask_field(MaskEditorField::Pattern);
+            // Reset cursor position to end of pattern
+            app.mask_draft.cursor_pos = app.mask_draft.pattern.len();
             app.push_status(
-                "Mask editor active – Tab moves between fields, arrows/space adjust options, Enter applies",
+                "Mask editor active – Type to enter pattern, Tab to switch fields, Enter to apply",
             );
         }
         KeyCode::Char('f') => {
@@ -271,8 +273,10 @@ fn handle_mask_editor_keys(key: KeyEvent, app: &mut App) {
                 app.push_status("Mask pattern cannot be empty");
                 return;
             }
+            // Generate a name based on the pattern and kind
+            let name = format!("{} '{}'", app.mask_draft.kind, app.mask_draft.pattern);
             let mask = ObjectMask {
-                name: app.mask_draft.name.clone(),
+                name,
                 pattern: app.mask_draft.pattern.clone(),
                 kind: app.mask_draft.kind.clone(),
                 case_sensitive: app.mask_draft.case_sensitive,
@@ -286,49 +290,63 @@ fn handle_mask_editor_keys(key: KeyEvent, app: &mut App) {
         KeyCode::BackTab => {
             app.previous_mask_field();
         }
-        KeyCode::Backspace => match app.mask_field {
-            MaskEditorField::Name => {
-                app.mask_draft.name.pop();
+        KeyCode::Backspace => {
+            if matches!(app.mask_field, MaskEditorField::Pattern) {
+                if app.mask_draft.cursor_pos > 0 {
+                    app.mask_draft.pattern.remove(app.mask_draft.cursor_pos - 1);
+                    app.mask_draft.cursor_pos -= 1;
+                }
             }
-            MaskEditorField::Pattern => {
-                app.mask_draft.pattern.pop();
+        }
+        KeyCode::Delete => {
+            if matches!(app.mask_field, MaskEditorField::Pattern) {
+                if app.mask_draft.cursor_pos < app.mask_draft.pattern.len() {
+                    app.mask_draft.pattern.remove(app.mask_draft.cursor_pos);
+                }
             }
-            _ => {}
-        },
+        }
         KeyCode::Left => match app.mask_field {
+            MaskEditorField::Pattern => {
+                if app.mask_draft.cursor_pos > 0 {
+                    app.mask_draft.cursor_pos -= 1;
+                }
+            }
             MaskEditorField::Mode => app.cycle_mask_kind_backwards(),
             MaskEditorField::Case => app.toggle_mask_case(),
-            _ => {}
         },
         KeyCode::Right => match app.mask_field {
+            MaskEditorField::Pattern => {
+                if app.mask_draft.cursor_pos < app.mask_draft.pattern.len() {
+                    app.mask_draft.cursor_pos += 1;
+                }
+            }
             MaskEditorField::Mode => app.cycle_mask_kind(),
             MaskEditorField::Case => app.toggle_mask_case(),
-            _ => {}
         },
+        KeyCode::Home => {
+            if matches!(app.mask_field, MaskEditorField::Pattern) {
+                app.mask_draft.cursor_pos = 0;
+            }
+        }
+        KeyCode::End => {
+            if matches!(app.mask_field, MaskEditorField::Pattern) {
+                app.mask_draft.cursor_pos = app.mask_draft.pattern.len();
+            }
+        }
         KeyCode::Char(' ') => match app.mask_field {
             MaskEditorField::Mode => app.cycle_mask_kind(),
             MaskEditorField::Case => app.toggle_mask_case(),
-            MaskEditorField::Name => {
-                // Clear placeholder if still default
-                if app.mask_draft.name == "Untitled mask" {
-                    app.mask_draft.name.clear();
-                }
-                app.mask_draft.name.push(' ');
+            MaskEditorField::Pattern => {
+                app.mask_draft.pattern.insert(app.mask_draft.cursor_pos, ' ');
+                app.mask_draft.cursor_pos += 1;
             }
-            MaskEditorField::Pattern => app.mask_draft.pattern.push(' '),
         },
-        KeyCode::Char(ch) => match app.mask_field {
-            MaskEditorField::Name => {
-                // Clear placeholder if still default
-                if app.mask_draft.name == "Untitled mask" {
-                    app.mask_draft.name.clear();
-                }
-                app.mask_draft.name.push(ch);
+        KeyCode::Char(ch) => {
+            if matches!(app.mask_field, MaskEditorField::Pattern) {
+                app.mask_draft.pattern.insert(app.mask_draft.cursor_pos, ch);
+                app.mask_draft.cursor_pos += 1;
             }
-            MaskEditorField::Pattern => app.mask_draft.pattern.push(ch),
-            MaskEditorField::Mode => {}
-            MaskEditorField::Case => {}
-        },
+        }
         _ => {}
     }
 }
@@ -987,11 +1005,26 @@ fn draw_object_detail(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             .last_modified
             .clone()
             .unwrap_or_else(|| "unknown".into());
-        let restore = obj
-            .restore_state
-            .as_ref()
-            .map(describe_restore_state)
-            .unwrap_or_else(|| "n/a".into());
+
+        // Match the restore status labels used in the objects list
+        let restore = match &obj.restore_state {
+            Some(RestoreState::Available) => "Restored".to_string(),
+            Some(RestoreState::InProgress { .. }) => "Restoring".to_string(),
+            Some(RestoreState::Expired) => "Expired".to_string(),
+            None => {
+                // Check if object is in Glacier and needs restore
+                if matches!(
+                    obj.storage_class,
+                    crate::models::StorageClassTier::GlacierFlexibleRetrieval
+                    | crate::models::StorageClassTier::GlacierDeepArchive
+                ) {
+                    "NeedsRestore".to_string()
+                } else {
+                    "N/A".to_string()
+                }
+            }
+        };
+
         vec![
             Line::from(format!("Key: {}", obj.key)),
             Line::from(format!("Size: {}", format_size(obj.size))),
@@ -1101,46 +1134,102 @@ fn draw_command_bar(frame: &mut ratatui::Frame, area: Rect) {
 }
 
 fn draw_mask_popup(frame: &mut ratatui::Frame, app: &App) {
-    let area = centered_rect(60, 30, frame.size());
+    let area = centered_rect(70, 40, frame.size());
     draw_modal_surface(frame, area);
+
+    let title_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let block = Block::default()
-        .title("Mask editor – Tab moves fields, arrows/space adjust options, Enter applies, Esc cancels")
+        .title(Span::styled(" Create Object Filter ", title_style))
         .borders(Borders::ALL)
-        .style(Style::default().bg(Color::Black));
-    let text = vec![
-        field_line(
-            "Name: ",
-            &app.mask_draft.name,
-            matches!(app.mask_field, MaskEditorField::Name),
-        ),
-        field_line(
-            "Pattern: ",
-            &app.mask_draft.pattern,
-            matches!(app.mask_field, MaskEditorField::Pattern),
-        ),
-        Line::from(vec![
-            Span::styled(
-                "Match mode: ",
-                mask_field_style(matches!(app.mask_field, MaskEditorField::Mode)),
-            ),
-            Span::raw(app.mask_draft.kind.to_string()),
-            Span::raw("  (use ←/→ or space)"),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "Case sensitive: ",
-                mask_field_style(matches!(app.mask_field, MaskEditorField::Case)),
-            ),
-            Span::raw(if app.mask_draft.case_sensitive {
-                "on"
-            } else {
-                "off"
-            }),
-            Span::raw("  (space or ←/→ toggles)"),
-        ]),
-        Line::from("Enter applies the mask. Esc cancels and restores previous filter."),
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::Rgb(20, 20, 30)));
+
+    let label_style = Style::default()
+        .fg(Color::LightBlue)
+        .add_modifier(Modifier::BOLD);
+    let active_style = Style::default()
+        .fg(Color::LightYellow)
+        .add_modifier(Modifier::BOLD);
+    let inactive_style = Style::default().fg(Color::Gray);
+    let hint_style = Style::default().fg(Color::DarkGray);
+
+    // Create pattern field with cursor
+    let is_pattern_focused = matches!(app.mask_field, MaskEditorField::Pattern);
+    let mut pattern_spans = vec![
+        Span::styled("Pattern: ", label_style),
     ];
-    let para = Paragraph::new(text).block(block).wrap(Wrap { trim: true });
+
+    if is_pattern_focused {
+        // Show cursor in pattern field
+        let before_cursor = &app.mask_draft.pattern[..app.mask_draft.cursor_pos];
+        let cursor_char = if app.mask_draft.cursor_pos < app.mask_draft.pattern.len() {
+            app.mask_draft.pattern.chars().nth(app.mask_draft.cursor_pos).unwrap().to_string()
+        } else {
+            " ".to_string()
+        };
+        let after_cursor = if app.mask_draft.cursor_pos < app.mask_draft.pattern.len() {
+            &app.mask_draft.pattern[app.mask_draft.cursor_pos + 1..]
+        } else {
+            ""
+        };
+
+        pattern_spans.push(Span::styled(before_cursor, active_style));
+        pattern_spans.push(Span::styled(cursor_char, Style::default().fg(Color::Black).bg(Color::LightYellow)));
+        pattern_spans.push(Span::styled(after_cursor, active_style));
+    } else {
+        let display = if app.mask_draft.pattern.is_empty() {
+            "(empty)"
+        } else {
+            &app.mask_draft.pattern
+        };
+        pattern_spans.push(Span::styled(display, inactive_style));
+    }
+
+    let text = vec![
+        Line::from(""),
+        Line::from(pattern_spans),
+        Line::from(vec![
+            Span::styled("          ", Style::default()),
+            Span::styled("↑ Type your filter pattern here", hint_style),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "Match Mode: ",
+                if matches!(app.mask_field, MaskEditorField::Mode) { active_style } else { label_style }
+            ),
+            Span::styled(
+                app.mask_draft.kind.to_string(),
+                if matches!(app.mask_field, MaskEditorField::Mode) { active_style } else { inactive_style }
+            ),
+            Span::styled("  (use ←/→ or space)", hint_style),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "Case Sensitive: ",
+                if matches!(app.mask_field, MaskEditorField::Case) { active_style } else { label_style }
+            ),
+            Span::styled(
+                if app.mask_draft.case_sensitive { "Yes" } else { "No" },
+                if matches!(app.mask_field, MaskEditorField::Case) { active_style } else { inactive_style }
+            ),
+            Span::styled("  (space or ←/→ toggles)", hint_style),
+        ]),
+        Line::from(""),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Tab", Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
+            Span::styled(" move between fields  ", hint_style),
+            Span::styled("Enter", Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
+            Span::styled(" apply  ", hint_style),
+            Span::styled("Esc", Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
+            Span::styled(" cancel", hint_style),
+        ]),
+    ];
+    let para = Paragraph::new(text).block(block);
     frame.render_widget(para, area);
 }
 
@@ -1431,37 +1520,6 @@ fn draw_modal_surface(frame: &mut ratatui::Frame, area: Rect) {
         if shadow_height > 0 {
             let shadow = Rect::new(area.x + area.width, area.y + 1, 1, shadow_height);
             frame.render_widget(Block::default().style(shadow_style), shadow);
-        }
-    }
-}
-
-fn field_line(label: &str, value: &str, selected: bool) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(label.to_string(), mask_field_style(selected)),
-        Span::raw(value.to_string()),
-    ])
-}
-
-fn mask_field_style(selected: bool) -> Style {
-    if selected {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    }
-}
-
-fn describe_restore_state(state: &RestoreState) -> String {
-    match state {
-        RestoreState::Available => "available".into(),
-        RestoreState::Expired => "expired".into(),
-        RestoreState::InProgress { expiry } => {
-            if let Some(expiry) = expiry {
-                format!("in-progress (ready until {expiry})")
-            } else {
-                "in-progress".into()
-            }
         }
     }
 }
